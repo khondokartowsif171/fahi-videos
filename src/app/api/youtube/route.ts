@@ -22,19 +22,6 @@ function extractVideoId(url: string): string | null {
   }
 }
 
-// Reuse a single Innertube instance across requests (module-level singleton)
-let ytInstance: Innertube | null = null;
-
-async function getYT(): Promise<Innertube> {
-  if (!ytInstance) {
-    ytInstance = await Innertube.create({
-      cache: undefined,
-      generate_session_locally: true,
-    });
-  }
-  return ytInstance;
-}
-
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const url = searchParams.get('url');
@@ -49,8 +36,14 @@ export async function GET(request: Request) {
   }
 
   try {
-    const yt = await getYT();
-    const info = await yt.getInfo(videoId);
+    // Fresh instance per request — safer on Vercel serverless (no stale player state)
+    const yt = await Innertube.create({
+      cache: undefined,
+      generate_session_locally: true,
+    });
+
+    // ANDROID client returns streaming_data reliably with direct (non-ciphered) URLs
+    const info = await yt.getInfo(videoId, { client: 'ANDROID' });
 
     const basic = info.basic_info;
     const streamingData = info.streaming_data;
@@ -62,10 +55,25 @@ export async function GET(request: Request) {
       );
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const resolveUrl = (f: any): string | null => {
+      try {
+        if (f.url) return f.url as string;
+        // Fallback: decipher if URL is signed
+        if (typeof f.decipher === 'function') {
+          return f.decipher(yt.session.player) as string;
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    };
+
     // Muxed formats (video + audio together) — directly downloadable
     const muxedFormats = (streamingData.formats ?? [])
-      .filter((f) => f.url)
       .map((f) => {
+        const resolvedUrl = resolveUrl(f);
+        if (!resolvedUrl) return null;
         const quality = f.quality_label ?? `${f.height ?? '?'}p`;
         const container = (f.mime_type ?? 'video/mp4').split(';')[0].split('/')[1] ?? 'mp4';
         return {
@@ -75,18 +83,20 @@ export async function GET(request: Request) {
           hasVideo: true,
           hasAudio: true,
           contentLength: f.content_length?.toString(),
-          url: f.url!,
+          url: resolvedUrl,
           mimeType: f.mime_type ?? 'video/mp4',
           bitrate: f.bitrate,
-          audioBitrate: f.audio_sample_rate ? Math.round(f.bitrate / 1000) : undefined,
         };
-      });
+      })
+      .filter(Boolean);
 
     // Audio-only formats
     const audioFormats = (streamingData.adaptive_formats ?? [])
-      .filter((f) => f.url && !f.has_video && f.has_audio)
+      .filter((f) => !f.has_video && f.has_audio)
       .slice(0, 3)
       .map((f) => {
+        const resolvedUrl = resolveUrl(f);
+        if (!resolvedUrl) return null;
         const container = (f.mime_type ?? 'audio/mp4').split(';')[0].split('/')[1] ?? 'm4a';
         const kbps = f.bitrate ? Math.round(f.bitrate / 1000) : '?';
         return {
@@ -96,12 +106,13 @@ export async function GET(request: Request) {
           hasVideo: false,
           hasAudio: true,
           contentLength: f.content_length?.toString(),
-          url: f.url!,
+          url: resolvedUrl,
           mimeType: f.mime_type ?? 'audio/mp4',
           bitrate: f.bitrate,
           audioBitrate: typeof kbps === 'number' ? kbps : undefined,
         };
-      });
+      })
+      .filter(Boolean);
 
     const formats = [...muxedFormats, ...audioFormats];
 
@@ -135,9 +146,6 @@ export async function GET(request: Request) {
     if (message.includes('not found') || message.includes('unavailable')) {
       return NextResponse.json({ error: 'Video not found or unavailable' }, { status: 404 });
     }
-
-    // Reset instance on error so next request gets a fresh one
-    ytInstance = null;
 
     return NextResponse.json(
       { error: 'Failed to fetch video info. Try again.' },
