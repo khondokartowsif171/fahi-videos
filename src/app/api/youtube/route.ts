@@ -1,15 +1,38 @@
 import { NextResponse } from 'next/server';
-import ytdl from '@distube/ytdl-core';
+import { Innertube } from 'youtubei.js';
 
 export const runtime = 'nodejs';
 export const maxDuration = 30;
 
-function isValidYouTubeUrl(url: string): boolean {
+function extractVideoId(url: string): string | null {
   try {
-    return ytdl.validateURL(url);
+    const patterns = [
+      /[?&]v=([a-zA-Z0-9_-]{11})/,
+      /youtu\.be\/([a-zA-Z0-9_-]{11})/,
+      /\/embed\/([a-zA-Z0-9_-]{11})/,
+      /\/shorts\/([a-zA-Z0-9_-]{11})/,
+    ];
+    for (const p of patterns) {
+      const m = url.match(p);
+      if (m) return m[1];
+    }
+    return null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+// Reuse a single Innertube instance across requests (module-level singleton)
+let ytInstance: Innertube | null = null;
+
+async function getYT(): Promise<Innertube> {
+  if (!ytInstance) {
+    ytInstance = await Innertube.create({
+      cache: undefined,
+      generate_session_locally: true,
+    });
+  }
+  return ytInstance;
 }
 
 export async function GET(request: Request) {
@@ -20,86 +43,105 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'URL parameter is required' }, { status: 400 });
   }
 
-  if (!isValidYouTubeUrl(url)) {
+  const videoId = extractVideoId(url);
+  if (!videoId) {
     return NextResponse.json({ error: 'Invalid YouTube URL' }, { status: 400 });
   }
 
   try {
-    const info = await ytdl.getInfo(url, {
-      requestOptions: {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        },
-      },
-    });
+    const yt = await getYT();
+    const info = await yt.getInfo(videoId);
 
-    const { videoDetails } = info;
+    const basic = info.basic_info;
+    const streamingData = info.streaming_data;
 
-    // Get all formats with URLs
-    const allFormats = info.formats.filter((f) => f.url);
+    if (!streamingData) {
+      return NextResponse.json(
+        { error: 'No streaming data available for this video' },
+        { status: 404 }
+      );
+    }
 
-    // Prioritize muxed (audio+video) formats as they download directly
-    const muxedFormats = ytdl.filterFormats(allFormats, 'videoandaudio').map((f) => ({
-      itag: f.itag,
-      qualityLabel: f.qualityLabel || 'Unknown',
-      container: f.container || 'mp4',
-      hasVideo: !!f.hasVideo,
-      hasAudio: !!f.hasAudio,
-      contentLength: f.contentLength,
-      url: f.url,
-      mimeType: f.mimeType || 'video/mp4',
-      bitrate: f.bitrate,
-      audioBitrate: f.audioBitrate,
-    }));
+    // Muxed formats (video + audio together) — directly downloadable
+    const muxedFormats = (streamingData.formats ?? [])
+      .filter((f) => f.url)
+      .map((f) => {
+        const quality = f.quality_label ?? `${f.height ?? '?'}p`;
+        const container = (f.mime_type ?? 'video/mp4').split(';')[0].split('/')[1] ?? 'mp4';
+        return {
+          itag: f.itag ?? 0,
+          qualityLabel: quality,
+          container,
+          hasVideo: true,
+          hasAudio: true,
+          contentLength: f.content_length?.toString(),
+          url: f.url!,
+          mimeType: f.mime_type ?? 'video/mp4',
+          bitrate: f.bitrate,
+          audioBitrate: f.audio_sample_rate ? Math.round(f.bitrate / 1000) : undefined,
+        };
+      });
 
-    // Audio only formats
-    const audioFormats = ytdl.filterFormats(allFormats, 'audioonly').slice(0, 3).map((f) => ({
-      itag: f.itag,
-      qualityLabel: `Audio (${f.audioBitrate || '?'}kbps)`,
-      container: f.container || 'm4a',
-      hasVideo: false,
-      hasAudio: true,
-      contentLength: f.contentLength,
-      url: f.url,
-      mimeType: f.mimeType || 'audio/mp4',
-      bitrate: f.bitrate,
-      audioBitrate: f.audioBitrate,
-    }));
+    // Audio-only formats
+    const audioFormats = (streamingData.adaptive_formats ?? [])
+      .filter((f) => f.url && !f.has_video && f.has_audio)
+      .slice(0, 3)
+      .map((f) => {
+        const container = (f.mime_type ?? 'audio/mp4').split(';')[0].split('/')[1] ?? 'm4a';
+        const kbps = f.bitrate ? Math.round(f.bitrate / 1000) : '?';
+        return {
+          itag: f.itag ?? 0,
+          qualityLabel: `Audio (${kbps}kbps)`,
+          container,
+          hasVideo: false,
+          hasAudio: true,
+          contentLength: f.content_length?.toString(),
+          url: f.url!,
+          mimeType: f.mime_type ?? 'audio/mp4',
+          bitrate: f.bitrate,
+          audioBitrate: typeof kbps === 'number' ? kbps : undefined,
+        };
+      });
 
     const formats = [...muxedFormats, ...audioFormats];
 
     if (formats.length === 0) {
       return NextResponse.json(
-        { error: 'No downloadable formats found for this video' },
+        { error: 'No downloadable formats found. Video may be restricted.' },
         { status: 404 }
       );
     }
 
-    // Get best thumbnail
-    const thumbnails = videoDetails.thumbnails || [];
+    // Best thumbnail
+    const thumbnails = basic.thumbnail ?? [];
     const thumbnail =
-      thumbnails.sort((a, b) => (b.width || 0) - (a.width || 0))[0]?.url || '';
+      [...thumbnails].sort((a, b) => (b.width ?? 0) - (a.width ?? 0))[0]?.url ?? '';
 
     return NextResponse.json({
-      title: videoDetails.title,
+      title: basic.title ?? 'Unknown Title',
       thumbnail,
-      duration: parseInt(videoDetails.lengthSeconds || '0', 10),
-      channel: videoDetails.author?.name || 'Unknown',
-      viewCount: videoDetails.viewCount,
+      duration: basic.duration ?? 0,
+      channel: basic.channel?.name ?? basic.author ?? 'Unknown',
+      viewCount: basic.view_count?.toString(),
       formats,
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Failed to fetch video info';
+    const message = err instanceof Error ? err.message : 'Unknown error';
     console.error('YouTube fetch error:', message);
 
-    if (message.includes('private') || message.includes('age-restricted')) {
-      return NextResponse.json({ error: 'Video is private or age-restricted' }, { status: 403 });
+    if (message.includes('private') || message.includes('LOGIN_REQUIRED')) {
+      return NextResponse.json({ error: 'Video is private or requires login' }, { status: 403 });
     }
     if (message.includes('not found') || message.includes('unavailable')) {
       return NextResponse.json({ error: 'Video not found or unavailable' }, { status: 404 });
     }
 
-    return NextResponse.json({ error: 'Failed to fetch video info. Try again.' }, { status: 500 });
+    // Reset instance on error so next request gets a fresh one
+    ytInstance = null;
+
+    return NextResponse.json(
+      { error: 'Failed to fetch video info. Try again.' },
+      { status: 500 }
+    );
   }
 }
