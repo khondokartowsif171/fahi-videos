@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from 'next/server';
 import { Innertube } from 'youtubei.js';
 
@@ -22,6 +23,9 @@ function extractVideoId(url: string): string | null {
   }
 }
 
+// Try multiple clients in order until one returns streaming_data
+const CLIENTS = ['ANDROID', 'IOS', 'TV_EMBEDDED', 'WEB'] as const;
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const url = searchParams.get('url');
@@ -36,30 +40,37 @@ export async function GET(request: Request) {
   }
 
   try {
-    // Fresh instance per request — safer on Vercel serverless (no stale player state)
     const yt = await Innertube.create({
       cache: undefined,
       generate_session_locally: true,
     });
 
-    // ANDROID client returns streaming_data reliably with direct (non-ciphered) URLs
-    const info = await yt.getInfo(videoId, { client: 'ANDROID' });
+    let info: any = null;
+    for (const client of CLIENTS) {
+      try {
+        const candidate = await yt.getInfo(videoId, { client });
+        if (candidate.streaming_data) {
+          info = candidate;
+          break;
+        }
+      } catch {
+        // try next client
+      }
+    }
 
-    const basic = info.basic_info;
-    const streamingData = info.streaming_data;
-
-    if (!streamingData) {
+    if (!info?.streaming_data) {
       return NextResponse.json(
         { error: 'No streaming data available for this video' },
         { status: 404 }
       );
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const basic = info.basic_info;
+    const streamingData = info.streaming_data;
+
     const resolveUrl = (f: any): string | null => {
       try {
         if (f.url) return f.url as string;
-        // Fallback: decipher if URL is signed
         if (typeof f.decipher === 'function') {
           return f.decipher(yt.session.player) as string;
         }
@@ -69,9 +80,9 @@ export async function GET(request: Request) {
       }
     };
 
-    // Muxed formats (video + audio together) — directly downloadable
+    // Muxed formats (video + audio together)
     const muxedFormats = (streamingData.formats ?? [])
-      .map((f) => {
+      .map((f: any) => {
         const resolvedUrl = resolveUrl(f);
         if (!resolvedUrl) return null;
         const quality = f.quality_label ?? `${f.height ?? '?'}p`;
@@ -92,9 +103,9 @@ export async function GET(request: Request) {
 
     // Audio-only formats
     const audioFormats = (streamingData.adaptive_formats ?? [])
-      .filter((f) => !f.has_video && f.has_audio)
+      .filter((f: any) => !f.has_video && f.has_audio)
       .slice(0, 3)
-      .map((f) => {
+      .map((f: any) => {
         const resolvedUrl = resolveUrl(f);
         if (!resolvedUrl) return null;
         const container = (f.mime_type ?? 'audio/mp4').split(';')[0].split('/')[1] ?? 'm4a';
@@ -123,10 +134,9 @@ export async function GET(request: Request) {
       );
     }
 
-    // Best thumbnail
     const thumbnails = basic.thumbnail ?? [];
     const thumbnail =
-      [...thumbnails].sort((a, b) => (b.width ?? 0) - (a.width ?? 0))[0]?.url ?? '';
+      [...thumbnails].sort((a: any, b: any) => (b.width ?? 0) - (a.width ?? 0))[0]?.url ?? '';
 
     return NextResponse.json({
       title: basic.title ?? 'Unknown Title',
