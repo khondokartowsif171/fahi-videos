@@ -23,35 +23,10 @@ function extractVideoId(url: string): string | null {
   }
 }
 
-// Resolve a format's URL — handles direct string URLs, URL objects, and async decipher()
-async function resolveUrl(f: any, player: any): Promise<string | null> {
-  try {
-    if (f.url) {
-      const u = f.url;
-      if (typeof u === 'string') return u;
-      // URL object — call toString()
-      const s: string = typeof u.toString === 'function' ? u.toString() : String(u);
-      return s && s !== '[object Object]' ? s : null;
-    }
-    if (typeof f.decipher === 'function') {
-      // decipher() may be sync or async
-      let result = f.decipher(player);
-      if (result && typeof (result as any).then === 'function') {
-        result = await result;
-      }
-      if (!result) return null;
-      if (typeof result === 'string') return result;
-      const s: string = typeof result.toString === 'function' ? result.toString() : String(result);
-      return s && s !== '[object Object]' ? s : null;
-    }
-    return null;
-  } catch {
-    return null;
-  }
+function getUrl(f: any): string | null {
+  if (typeof f.url === 'string' && f.url.startsWith('https://')) return f.url;
+  return null;
 }
-
-// Try multiple clients in order until one returns streaming_data
-const CLIENTS = ['ANDROID', 'IOS', 'TV_EMBEDDED', 'WEB'] as const;
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -68,122 +43,113 @@ export async function GET(request: Request) {
 
   try {
     const yt = await Innertube.create({ cache: undefined });
-    const player = yt.session.player;
 
-    let info: any = null;
-    for (const client of CLIENTS) {
-      try {
-        const candidate = await yt.getInfo(videoId, { client });
-        if (candidate.streaming_data) {
-          info = candidate;
-          break;
-        }
-      } catch {
-        // try next client
-      }
-    }
+    // ANDROID gives direct string URLs for muxed formats.
+    // IOS gives direct string URLs for adaptive formats.
+    // Run both in parallel.
+    const [androidResult, iosResult] = await Promise.allSettled([
+      yt.getInfo(videoId, { client: 'ANDROID' }),
+      yt.getInfo(videoId, { client: 'IOS' }),
+    ]);
 
-    if (!info?.streaming_data) {
+    const androidInfo = androidResult.status === 'fulfilled' ? androidResult.value : null;
+    const iosInfo = iosResult.status === 'fulfilled' ? iosResult.value : null;
+
+    if (!androidInfo?.streaming_data && !iosInfo?.streaming_data) {
       return NextResponse.json(
         { error: 'No streaming data available for this video' },
         { status: 404 }
       );
     }
 
-    const basic = info.basic_info;
-    const streamingData = info.streaming_data;
+    // Prefer ANDROID for basic_info; fall back to IOS
+    const basic = (androidInfo ?? iosInfo)!.basic_info;
 
-    // Muxed formats (video + audio together)
-    const muxedFormats = (
-      await Promise.all(
-        (streamingData.formats ?? []).map(async (f: any) => {
-          const resolvedUrl = await resolveUrl(f, player);
-          if (!resolvedUrl) return null;
-          const quality = f.quality_label ?? `${f.height ?? '?'}p`;
-          const container = (f.mime_type ?? 'video/mp4').split(';')[0].split('/')[1] ?? 'mp4';
-          return {
-            itag: f.itag ?? 0,
-            qualityLabel: quality,
-            container,
-            hasVideo: true,
-            hasAudio: true,
-            contentLength: f.content_length?.toString(),
-            url: resolvedUrl,
-            mimeType: f.mime_type ?? 'video/mp4',
-            bitrate: f.bitrate,
-          };
-        })
-      )
-    ).filter(Boolean);
+    // Muxed formats (video + audio) — ANDROID has direct string URLs for these
+    const muxedSd = androidInfo?.streaming_data ?? iosInfo?.streaming_data;
+    const muxedFormats = (muxedSd?.formats ?? [])
+      .map((f: any) => {
+        const resolvedUrl = getUrl(f);
+        if (!resolvedUrl) return null;
+        const quality = f.quality_label ?? `${f.height ?? '?'}p`;
+        const container = (f.mime_type ?? 'video/mp4').split(';')[0].split('/')[1] ?? 'mp4';
+        return {
+          itag: f.itag ?? 0,
+          qualityLabel: quality,
+          container,
+          hasVideo: true,
+          hasAudio: true,
+          contentLength: f.content_length?.toString(),
+          url: resolvedUrl,
+          mimeType: f.mime_type ?? 'video/mp4',
+          bitrate: f.bitrate,
+        };
+      })
+      .filter(Boolean);
 
-    const allAdaptive: any[] = streamingData.adaptive_formats ?? [];
+    // Adaptive formats — IOS has direct string URLs for these
+    const allAdaptive: any[] = iosInfo?.streaming_data?.adaptive_formats ?? [];
 
-    // Best audio stream for client-side merging with video-only formats
-    const audioOnlyCandidates = allAdaptive.filter((f: any) => f.has_audio && !f.has_video);
-    audioOnlyCandidates.sort((a: any, b: any) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
-    const bestAudioFmt = audioOnlyCandidates[0] ?? null;
-    const bestAudioUrl = bestAudioFmt ? await resolveUrl(bestAudioFmt, player) : null;
+    // Best audio stream for client-side merge
+    const bestAudioFmt = [...allAdaptive]
+      .filter((f: any) => f.has_audio && !f.has_video)
+      .sort((a: any, b: any) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0] ?? null;
+    const bestAudioUrl = bestAudioFmt ? getUrl(bestAudioFmt) : null;
     const bestAudioMime: string = bestAudioFmt?.mime_type ?? 'audio/mp4';
 
-    // Video-only adaptive formats >= 720p (need client-side FFmpeg merge)
+    // Video-only adaptive formats >= 720p (client merges audio via FFmpeg.wasm)
     const seenHeights = new Set<number>();
-    const videoOnlyFormats = (
-      await Promise.all(
-        allAdaptive
-          .filter((f: any) => f.has_video && !f.has_audio && (f.height ?? 0) >= 720)
-          .sort((a: any, b: any) => (b.height ?? 0) - (a.height ?? 0))
-          .map(async (f: any) => {
-            const h: number = f.height ?? 0;
-            if (seenHeights.has(h)) return null;
-            seenHeights.add(h);
-            const resolvedUrl = await resolveUrl(f, player);
-            if (!resolvedUrl || !bestAudioUrl) return null;
-            const container = (f.mime_type ?? 'video/mp4').split(';')[0].split('/')[1] ?? 'mp4';
-            return {
-              itag: f.itag ?? 0,
-              qualityLabel: f.quality_label ?? `${h}p`,
-              container,
-              hasVideo: true,
-              hasAudio: false,
-              contentLength: f.content_length?.toString(),
-              url: resolvedUrl,
-              mimeType: f.mime_type ?? 'video/mp4',
-              bitrate: f.bitrate,
-              audioUrl: bestAudioUrl,
-              audioMimeType: bestAudioMime,
-            };
-          })
-      )
-    ).filter(Boolean);
+    const videoOnlyFormats = allAdaptive
+      .filter((f: any) => f.has_video && !f.has_audio && (f.height ?? 0) >= 720)
+      .sort((a: any, b: any) => (b.height ?? 0) - (a.height ?? 0))
+      .map((f: any) => {
+        const h: number = f.height ?? 0;
+        if (seenHeights.has(h)) return null;
+        seenHeights.add(h);
+        const resolvedUrl = getUrl(f);
+        if (!resolvedUrl || !bestAudioUrl) return null;
+        const container = (f.mime_type ?? 'video/mp4').split(';')[0].split('/')[1] ?? 'mp4';
+        return {
+          itag: f.itag ?? 0,
+          qualityLabel: f.quality_label ?? `${h}p`,
+          container,
+          hasVideo: true,
+          hasAudio: false,
+          contentLength: f.content_length?.toString(),
+          url: resolvedUrl,
+          mimeType: f.mime_type ?? 'video/mp4',
+          bitrate: f.bitrate,
+          audioUrl: bestAudioUrl,
+          audioMimeType: bestAudioMime,
+        };
+      })
+      .filter(Boolean);
 
-    // Audio-only formats
-    const audioFormats = (
-      await Promise.all(
-        allAdaptive
-          .filter((f: any) => !f.has_video && f.has_audio)
-          .slice(0, 3)
-          .map(async (f: any) => {
-            const resolvedUrl = await resolveUrl(f, player);
-            if (!resolvedUrl) return null;
-            const container = (f.mime_type ?? 'audio/mp4').split(';')[0].split('/')[1] ?? 'm4a';
-            const kbps = f.bitrate ? Math.round(f.bitrate / 1000) : '?';
-            return {
-              itag: f.itag ?? 0,
-              qualityLabel: `Audio (${kbps}kbps)`,
-              container,
-              hasVideo: false,
-              hasAudio: true,
-              contentLength: f.content_length?.toString(),
-              url: resolvedUrl,
-              mimeType: f.mime_type ?? 'audio/mp4',
-              bitrate: f.bitrate,
-              audioBitrate: typeof kbps === 'number' ? kbps : undefined,
-            };
-          })
-      )
-    ).filter(Boolean);
+    // Audio-only formats (top 3 by bitrate)
+    const audioFormats = allAdaptive
+      .filter((f: any) => !f.has_video && f.has_audio)
+      .slice(0, 3)
+      .map((f: any) => {
+        const resolvedUrl = getUrl(f);
+        if (!resolvedUrl) return null;
+        const container = (f.mime_type ?? 'audio/mp4').split(';')[0].split('/')[1] ?? 'm4a';
+        const kbps = f.bitrate ? Math.round(f.bitrate / 1000) : '?';
+        return {
+          itag: f.itag ?? 0,
+          qualityLabel: `Audio (${kbps}kbps)`,
+          container,
+          hasVideo: false,
+          hasAudio: true,
+          contentLength: f.content_length?.toString(),
+          url: resolvedUrl,
+          mimeType: f.mime_type ?? 'audio/mp4',
+          bitrate: f.bitrate,
+          audioBitrate: typeof kbps === 'number' ? kbps : undefined,
+        };
+      })
+      .filter(Boolean);
 
-    // Order: muxed (360p) → HD video-only (1080p, 720p) → audio-only
+    // Order: muxed → HD video-only (1080p, 720p) → audio-only
     const formats = [...muxedFormats, ...videoOnlyFormats, ...audioFormats];
 
     if (formats.length === 0) {
