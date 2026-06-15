@@ -40,10 +40,7 @@ export async function GET(request: Request) {
   }
 
   try {
-    const yt = await Innertube.create({
-      cache: undefined,
-      generate_session_locally: true,
-    });
+    const yt = await Innertube.create({ cache: undefined });
 
     let info: any = null;
     for (const client of CLIENTS) {

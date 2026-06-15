@@ -17,8 +17,16 @@ export interface CompressOptions {
   outputFormat: 'mp4' | 'webm';
 }
 
+export interface CropOptions {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 export interface ProcessOptions {
   trim?: TrimOptions;
+  crop?: CropOptions;
   resize?: ResizeOptions;
   compress?: CompressOptions;
 }
@@ -60,7 +68,7 @@ export function buildFFmpegArgs(
   options: ProcessOptions
 ): string[] {
   const args: string[] = [];
-  const { trim, resize, compress } = options;
+  const { trim, crop, resize, compress } = options;
 
   // Input with optional fast seek for trim
   if (trim && trim.startTime > 0) {
@@ -71,11 +79,18 @@ export function buildFFmpegArgs(
     args.push('-to', String(trim.endTime - (trim.startTime || 0)));
   }
 
-  // Video filter for resize
+  // Build video filter chain: crop and/or scale
+  const filters: string[] = [];
+  if (crop && crop.width > 0 && crop.height > 0) {
+    filters.push(`crop=${crop.width}:${crop.height}:${crop.x}:${crop.y}`);
+  }
   if (resize && (resize.width > 0 || resize.height > 0)) {
     const w = resize.width > 0 ? resize.width : -2;
     const h = resize.height > 0 ? resize.height : -2;
-    args.push('-vf', `scale=${w}:${h}`);
+    filters.push(`scale=${w}:${h}`);
+  }
+  if (filters.length > 0) {
+    args.push('-vf', filters.join(','));
   }
 
   // Compression / codec
@@ -87,11 +102,11 @@ export function buildFFmpegArgs(
       args.push('-c:v', 'libx264', '-crf', String(compress.crf), '-preset', 'fast');
       args.push('-c:a', 'aac', '-b:a', '128k');
     }
-  } else if (!resize) {
-    // No video processing needed — stream copy
+  } else if (filters.length === 0) {
+    // No video processing — stream copy
     args.push('-c', 'copy');
   } else {
-    // Resize without explicit codec
+    // Video filter applied without explicit codec
     args.push('-c:a', 'copy');
   }
 

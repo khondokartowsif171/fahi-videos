@@ -7,6 +7,7 @@ import {
   Scissors,
   Maximize2,
   Gauge,
+  Crop,
   Play,
   Pause,
   Download,
@@ -16,7 +17,7 @@ import {
 } from 'lucide-react';
 import { cn, formatDuration, formatFileSize, blobToDownload, sanitizeFilename } from '@/lib/utils';
 import { processVideo } from '@/lib/ffmpeg-operations';
-import type { TrimOptions, ResizeOptions, CompressOptions } from '@/lib/ffmpeg-operations';
+import type { TrimOptions, ResizeOptions, CompressOptions, CropOptions } from '@/lib/ffmpeg-operations';
 
 type ProcessState = 'idle' | 'loading-ffmpeg' | 'processing' | 'done' | 'error';
 
@@ -49,6 +50,12 @@ export default function VideoEditor() {
   const [customWidth, setCustomWidth] = useState(1280);
   const [customHeight, setCustomHeight] = useState(720);
 
+  const [enableCrop, setEnableCrop] = useState(false);
+  const [cropX, setCropX] = useState(0);
+  const [cropY, setCropY] = useState(0);
+  const [cropWidth, setCropWidth] = useState(1280);
+  const [cropHeight, setCropHeight] = useState(720);
+
   const [enableCompress, setEnableCompress] = useState(false);
   const [crf, setCrf] = useState(28);
   const [outputFormat, setOutputFormat] = useState<'mp4' | 'webm'>('mp4');
@@ -78,6 +85,10 @@ export default function VideoEditor() {
     if (!v) return;
     setDuration(v.duration);
     setTrimEnd(v.duration);
+    if (v.videoWidth > 0) {
+      setCropWidth(v.videoWidth);
+      setCropHeight(v.videoHeight);
+    }
   };
 
   const togglePlay = () => {
@@ -97,12 +108,16 @@ export default function VideoEditor() {
 
     const options: {
       trim?: TrimOptions;
+      crop?: CropOptions;
       resize?: ResizeOptions;
       compress?: CompressOptions;
     } = {};
 
     if (enableTrim) {
       options.trim = { startTime: trimStart, endTime: trimEnd };
+    }
+    if (enableCrop && cropWidth > 0 && cropHeight > 0) {
+      options.crop = { x: cropX, y: cropY, width: cropWidth, height: cropHeight };
     }
     if (enableResize) {
       const preset = QUALITY_PRESETS[selectedPreset];
@@ -114,8 +129,8 @@ export default function VideoEditor() {
       options.compress = { crf, outputFormat };
     }
 
-    if (!enableTrim && !enableResize && !enableCompress) {
-      setError('Please enable at least one operation (Trim, Resize, or Compress).');
+    if (!enableTrim && !enableCrop && !enableResize && !enableCompress) {
+      setError('Please enable at least one operation (Trim, Crop, Resize, or Compress).');
       return;
     }
 
@@ -262,6 +277,74 @@ export default function VideoEditor() {
                   </div>
                   <p className="text-xs text-muted-foreground">
                     Duration: {formatDuration(trimEnd - trimStart)}
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {/* Crop */}
+            <div className="glass rounded-xl overflow-hidden">
+              <button
+                onClick={() => setEnableCrop(!enableCrop)}
+                className="w-full flex items-center gap-3 p-4 hover:bg-white/3 transition-colors"
+              >
+                <div className={cn('w-8 h-8 rounded-lg flex items-center justify-center', enableCrop ? 'bg-violet-500/20 text-violet-400' : 'bg-white/5 text-muted-foreground')}>
+                  <Crop className="w-4 h-4" />
+                </div>
+                <div className="flex-1 text-left">
+                  <p className="text-sm font-medium text-foreground">Crop</p>
+                  <p className="text-xs text-muted-foreground">Cut a custom region of the video</p>
+                </div>
+                <div className={cn('w-10 h-5 rounded-full transition-colors relative', enableCrop ? 'bg-violet-600' : 'bg-muted')}>
+                  <div className={cn('absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all', enableCrop ? 'left-5' : 'left-0.5')} />
+                </div>
+              </button>
+              {enableCrop && (
+                <div className="px-4 pb-4 border-t border-border/50 pt-4 space-y-3">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-xs text-muted-foreground mb-1 block">Width (px)</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={cropWidth}
+                        onChange={(e) => setCropWidth(parseInt(e.target.value) || 0)}
+                        className="w-full bg-white/5 border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-violet-500/50"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-muted-foreground mb-1 block">Height (px)</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={cropHeight}
+                        onChange={(e) => setCropHeight(parseInt(e.target.value) || 0)}
+                        className="w-full bg-white/5 border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-violet-500/50"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-muted-foreground mb-1 block">X offset (px)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        value={cropX}
+                        onChange={(e) => setCropX(parseInt(e.target.value) || 0)}
+                        className="w-full bg-white/5 border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-violet-500/50"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-muted-foreground mb-1 block">Y offset (px)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        value={cropY}
+                        onChange={(e) => setCropY(parseInt(e.target.value) || 0)}
+                        className="w-full bg-white/5 border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-violet-500/50"
+                      />
+                    </div>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Crops a {cropWidth}×{cropHeight}px region starting at ({cropX}, {cropY})
                   </p>
                 </div>
               )}
