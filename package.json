@@ -11,6 +11,7 @@
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.15",
     "@ffmpeg/util": "^0.12.2",
+    "@imgly/background-removal": "^1.7.0",
     "@radix-ui/react-label": "^2.1.9",
     "@radix-ui/react-progress": "^1.1.9",
     "@radix-ui/react-select": "^2.3.0",
@@ -21,6 +22,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "fabric": "^6.9.1",
+    "jszip": "^3.10.1",
     "lucide-react": "^1.18.0",
     "next": "14.2.35",
     "react": "^18",
