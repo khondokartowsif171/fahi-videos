@@ -67,9 +67,14 @@ export async function GET(request: Request) {
 
     const resolveUrl = (f: any): string | null => {
       try {
-        if (f.url) return f.url as string;
+        if (f.url) {
+          // f.url may be a URL object (not a plain string) — coerce to string
+          const s = String(f.url);
+          return s && s !== '[object Object]' ? s : null;
+        }
         if (typeof f.decipher === 'function') {
-          return f.decipher(yt.session.player) as string;
+          const s = String(f.decipher(yt.session.player) ?? '');
+          return s && s !== '[object Object]' ? s : null;
         }
         return null;
       } catch {
