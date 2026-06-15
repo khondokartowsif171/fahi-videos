@@ -98,8 +98,45 @@ export async function GET(request: Request) {
       })
       .filter(Boolean);
 
+    const allAdaptive: any[] = streamingData.adaptive_formats ?? [];
+
+    // Best audio stream for client-side merging with video-only formats
+    const bestAudioFmt = allAdaptive
+      .filter((f: any) => f.has_audio && !f.has_video)
+      .sort((a: any, b: any) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
+    const bestAudioUrl = bestAudioFmt ? resolveUrl(bestAudioFmt) : null;
+    const bestAudioMime: string = bestAudioFmt?.mime_type ?? 'audio/mp4';
+
+    // Video-only adaptive formats >= 720p (need client-side FFmpeg merge)
+    const seenHeights = new Set<number>();
+    const videoOnlyFormats = allAdaptive
+      .filter((f: any) => f.has_video && !f.has_audio && (f.height ?? 0) >= 720)
+      .sort((a: any, b: any) => (b.height ?? 0) - (a.height ?? 0))
+      .map((f: any) => {
+        const h: number = f.height ?? 0;
+        if (seenHeights.has(h)) return null;
+        seenHeights.add(h);
+        const resolvedUrl = resolveUrl(f);
+        if (!resolvedUrl || !bestAudioUrl) return null;
+        const container = (f.mime_type ?? 'video/mp4').split(';')[0].split('/')[1] ?? 'mp4';
+        return {
+          itag: f.itag ?? 0,
+          qualityLabel: f.quality_label ?? `${h}p`,
+          container,
+          hasVideo: true,
+          hasAudio: false,
+          contentLength: f.content_length?.toString(),
+          url: resolvedUrl,
+          mimeType: f.mime_type ?? 'video/mp4',
+          bitrate: f.bitrate,
+          audioUrl: bestAudioUrl,
+          audioMimeType: bestAudioMime,
+        };
+      })
+      .filter(Boolean);
+
     // Audio-only formats
-    const audioFormats = (streamingData.adaptive_formats ?? [])
+    const audioFormats = allAdaptive
       .filter((f: any) => !f.has_video && f.has_audio)
       .slice(0, 3)
       .map((f: any) => {
@@ -122,7 +159,8 @@ export async function GET(request: Request) {
       })
       .filter(Boolean);
 
-    const formats = [...muxedFormats, ...audioFormats];
+    // Order: muxed (360p) → HD video-only (1080p, 720p) → audio-only
+    const formats = [...muxedFormats, ...videoOnlyFormats, ...audioFormats];
 
     if (formats.length === 0) {
       return NextResponse.json(

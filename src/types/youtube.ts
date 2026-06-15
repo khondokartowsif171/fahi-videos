@@ -9,6 +9,8 @@ export interface VideoFormat {
   mimeType: string;
   bitrate?: number;
   audioBitrate?: number;
+  audioUrl?: string;
+  audioMimeType?: string;
 }
 
 export interface VideoInfo {
