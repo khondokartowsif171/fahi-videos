@@ -14,12 +14,31 @@ import {
   AlertCircle,
   CheckCircle2,
   Loader2,
+  SlidersHorizontal,
+  Zap,
+  RotateCw,
+  VolumeX,
+  Rewind,
+  Type,
+  Music,
+  Image as ImageIcon,
 } from 'lucide-react';
 import { cn, formatDuration, formatFileSize, blobToDownload, sanitizeFilename } from '@/lib/utils';
-import { processVideo } from '@/lib/ffmpeg-operations';
-import type { TrimOptions, ResizeOptions, CompressOptions, CropOptions } from '@/lib/ffmpeg-operations';
+import { processVideo, extractAudio, makeGif } from '@/lib/ffmpeg-operations';
+import type {
+  TrimOptions,
+  ResizeOptions,
+  CompressOptions,
+  CropOptions,
+  FilterAdjustOptions,
+  SpeedOptions,
+  RotateOptions,
+  WatermarkOptions,
+  GifOptions,
+} from '@/lib/ffmpeg-operations';
 
 type ProcessState = 'idle' | 'loading-ffmpeg' | 'processing' | 'done' | 'error';
+type OperationMode = 'video' | 'extract-audio' | 'gif';
 
 const QUALITY_PRESETS = [
   { label: '4K (2160p)', width: 3840, height: 2160 },
@@ -29,6 +48,16 @@ const QUALITY_PRESETS = [
   { label: '360p', width: 640, height: 360 },
   { label: 'Custom', width: 0, height: 0 },
 ];
+
+const SPEED_RATES = [0.25, 0.5, 1, 1.5, 2] as const;
+
+const WATERMARK_POSITIONS = [
+  { value: 'top-left', label: 'Top Left' },
+  { value: 'top-right', label: 'Top Right' },
+  { value: 'bottom-left', label: 'Bottom Left' },
+  { value: 'bottom-right', label: 'Bottom Right' },
+  { value: 'center', label: 'Center' },
+] as const;
 
 export default function VideoEditor() {
   const [file, setFile] = useState<File | null>(null);
@@ -40,25 +69,70 @@ export default function VideoEditor() {
   const [error, setError] = useState('');
   const [resultBlob, setResultBlob] = useState<Blob | null>(null);
 
-  // Options
+  // Operation mode
+  const [operationMode, setOperationMode] = useState<OperationMode>('video');
+
+  // Trim
   const [enableTrim, setEnableTrim] = useState(false);
   const [trimStart, setTrimStart] = useState(0);
   const [trimEnd, setTrimEnd] = useState(0);
 
+  // Resize
   const [enableResize, setEnableResize] = useState(false);
   const [selectedPreset, setSelectedPreset] = useState(2); // 720p default
   const [customWidth, setCustomWidth] = useState(1280);
   const [customHeight, setCustomHeight] = useState(720);
 
+  // Crop
   const [enableCrop, setEnableCrop] = useState(false);
   const [cropX, setCropX] = useState(0);
   const [cropY, setCropY] = useState(0);
   const [cropWidth, setCropWidth] = useState(1280);
   const [cropHeight, setCropHeight] = useState(720);
 
+  // Compress
   const [enableCompress, setEnableCompress] = useState(false);
   const [crf, setCrf] = useState(28);
   const [outputFormat, setOutputFormat] = useState<'mp4' | 'webm'>('mp4');
+
+  // Filters
+  const [enableFilters, setEnableFilters] = useState(false);
+  const [brightness, setBrightness] = useState(0);
+  const [contrast, setContrast] = useState(1);
+  const [saturation, setSaturation] = useState(1);
+  const [hue, setHue] = useState(0);
+
+  // Speed
+  const [enableSpeed, setEnableSpeed] = useState(false);
+  const [speedRate, setSpeedRate] = useState(1);
+
+  // Rotate & Flip
+  const [enableRotate, setEnableRotate] = useState(false);
+  const [rotateAngle, setRotateAngle] = useState<0 | 90 | 180 | 270>(0);
+  const [flipH, setFlipH] = useState(false);
+  const [flipV, setFlipV] = useState(false);
+
+  // Mute Audio
+  const [enableMute, setEnableMute] = useState(false);
+
+  // Reverse Video
+  const [enableReverse, setEnableReverse] = useState(false);
+
+  // Watermark
+  const [enableWatermark, setEnableWatermark] = useState(false);
+  const [watermarkText, setWatermarkText] = useState('');
+  const [watermarkFontSize, setWatermarkFontSize] = useState(32);
+  const [watermarkColor, setWatermarkColor] = useState('#ffffff');
+  const [watermarkPosition, setWatermarkPosition] = useState<WatermarkOptions['position']>('bottom-right');
+
+  // Extract Audio
+  const [audioFormat, setAudioFormat] = useState<'mp3' | 'aac'>('mp3');
+
+  // Video to GIF
+  const [gifFps, setGifFps] = useState(15);
+  const [gifWidth, setGifWidth] = useState(480);
+  const [gifStart, setGifStart] = useState('');
+  const [gifDuration, setGifDuration] = useState('');
 
   const videoRef = useRef<HTMLVideoElement>(null);
 
@@ -106,37 +180,109 @@ export default function VideoEditor() {
     setError('');
     setResultBlob(null);
 
-    const options: {
-      trim?: TrimOptions;
-      crop?: CropOptions;
-      resize?: ResizeOptions;
-      compress?: CompressOptions;
-    } = {};
-
-    if (enableTrim) {
-      options.trim = { startTime: trimStart, endTime: trimEnd };
-    }
-    if (enableCrop && cropWidth > 0 && cropHeight > 0) {
-      options.crop = { x: cropX, y: cropY, width: cropWidth, height: cropHeight };
-    }
-    if (enableResize) {
-      const preset = QUALITY_PRESETS[selectedPreset];
-      const w = preset.width || customWidth;
-      const h = preset.height || customHeight;
-      options.resize = { width: w, height: h, maintainAspect: true };
-    }
-    if (enableCompress) {
-      options.compress = { crf, outputFormat };
-    }
-
-    if (!enableTrim && !enableCrop && !enableResize && !enableCompress) {
-      setError('Please enable at least one operation (Trim, Crop, Resize, or Compress).');
-      return;
-    }
-
     try {
       setState('loading-ffmpeg');
       setProgress(0);
+
+      if (operationMode === 'extract-audio') {
+        const blob = await extractAudio(file, audioFormat, (p) => {
+          setProgress(p);
+          if (p > 10) setState('processing');
+        });
+        setResultBlob(blob);
+        setState('done');
+        return;
+      }
+
+      if (operationMode === 'gif') {
+        const gifOptions: GifOptions = {
+          fps: gifFps,
+          scale: gifWidth,
+          startTime: gifStart ? parseFloat(gifStart) : undefined,
+          duration: gifDuration ? parseFloat(gifDuration) : undefined,
+        };
+        const blob = await makeGif(file, gifOptions, (p) => {
+          setProgress(p);
+          if (p > 10) setState('processing');
+        });
+        setResultBlob(blob);
+        setState('done');
+        return;
+      }
+
+      // Default: processVideo mode
+      const options: {
+        trim?: TrimOptions;
+        crop?: CropOptions;
+        resize?: ResizeOptions;
+        compress?: CompressOptions;
+        filters?: FilterAdjustOptions;
+        speed?: SpeedOptions;
+        rotate?: RotateOptions;
+        watermark?: WatermarkOptions;
+        mute?: boolean;
+        reverse?: boolean;
+      } = {};
+
+      if (enableTrim) {
+        options.trim = { startTime: trimStart, endTime: trimEnd };
+      }
+      if (enableCrop && cropWidth > 0 && cropHeight > 0) {
+        options.crop = { x: cropX, y: cropY, width: cropWidth, height: cropHeight };
+      }
+      if (enableResize) {
+        const preset = QUALITY_PRESETS[selectedPreset];
+        const w = preset.width || customWidth;
+        const h = preset.height || customHeight;
+        options.resize = { width: w, height: h, maintainAspect: true };
+      }
+      if (enableCompress) {
+        options.compress = { crf, outputFormat };
+      }
+      if (enableFilters) {
+        options.filters = { brightness, contrast, saturation, hue };
+      }
+      if (enableSpeed && speedRate !== 1) {
+        options.speed = { rate: speedRate };
+      }
+      if (enableRotate && (rotateAngle !== 0 || flipH || flipV)) {
+        options.rotate = { angle: rotateAngle, flipH, flipV };
+      }
+      if (enableWatermark && watermarkText.trim()) {
+        options.watermark = {
+          text: watermarkText,
+          fontSize: watermarkFontSize,
+          color: watermarkColor,
+          position: watermarkPosition,
+        };
+      }
+      if (enableMute) {
+        options.mute = true;
+      }
+      if (enableReverse) {
+        options.reverse = true;
+      }
+
+      const anyEnabled =
+        enableTrim ||
+        enableCrop ||
+        enableResize ||
+        enableCompress ||
+        enableFilters ||
+        (enableSpeed && speedRate !== 1) ||
+        (enableRotate && (rotateAngle !== 0 || flipH || flipV)) ||
+        (enableWatermark && watermarkText.trim() !== '') ||
+        enableMute ||
+        enableReverse;
+
+      if (!anyEnabled) {
+        setError(
+          'Please enable at least one operation (Trim, Crop, Resize, Compress, Filters, Speed, Rotate/Flip, Watermark, Mute, or Reverse).'
+        );
+        setState('idle');
+        return;
+      }
+
       const blob = await processVideo(file, options, (p) => {
         setProgress(p);
         if (p > 10) setState('processing');
@@ -152,11 +298,31 @@ export default function VideoEditor() {
 
   const handleDownload = () => {
     if (!resultBlob || !file) return;
-    const ext = enableCompress ? outputFormat : (file.name.split('.').pop() || 'mp4');
-    blobToDownload(resultBlob, `${sanitizeFilename(file.name.replace(/\.[^.]+$/, ''))}_edited.${ext}`);
+    const baseName = sanitizeFilename(file.name.replace(/\.[^.]+$/, ''));
+    if (operationMode === 'extract-audio') {
+      blobToDownload(resultBlob, `${baseName}.${audioFormat}`);
+    } else if (operationMode === 'gif') {
+      blobToDownload(resultBlob, `${baseName}.gif`);
+    } else {
+      const ext = enableCompress ? outputFormat : (file.name.split('.').pop() || 'mp4');
+      blobToDownload(resultBlob, `${baseName}_edited.${ext}`);
+    }
+  };
+
+  const processButtonLabel = () => {
+    if (operationMode === 'extract-audio') return 'Extract Audio';
+    if (operationMode === 'gif') return 'Make GIF';
+    return 'Process Video';
   };
 
   const isProcessing = state === 'loading-ffmpeg' || state === 'processing';
+
+  // Shared toggle switch renderer
+  const ToggleSwitch = ({ enabled }: { enabled: boolean }) => (
+    <div className={cn('w-10 h-5 rounded-full transition-colors relative', enabled ? 'bg-violet-600' : 'bg-muted')}>
+      <div className={cn('absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all', enabled ? 'left-5' : 'left-0.5')} />
+    </div>
+  );
 
   return (
     <div className="max-w-3xl mx-auto space-y-6">
@@ -230,7 +396,8 @@ export default function VideoEditor() {
 
           {/* Operations */}
           <div className="space-y-3">
-            {/* Trim */}
+
+            {/* ── Trim ─────────────────────────────────────────────── */}
             <div className="glass rounded-xl overflow-hidden">
               <button
                 onClick={() => setEnableTrim(!enableTrim)}
@@ -243,9 +410,7 @@ export default function VideoEditor() {
                   <p className="text-sm font-medium text-foreground">Trim Video</p>
                   <p className="text-xs text-muted-foreground">Set start and end time</p>
                 </div>
-                <div className={cn('w-10 h-5 rounded-full transition-colors relative', enableTrim ? 'bg-violet-600' : 'bg-muted')}>
-                  <div className={cn('absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all', enableTrim ? 'left-5' : 'left-0.5')} />
-                </div>
+                <ToggleSwitch enabled={enableTrim} />
               </button>
               {enableTrim && (
                 <div className="px-4 pb-4 space-y-3 border-t border-border/50 pt-4">
@@ -282,7 +447,7 @@ export default function VideoEditor() {
               )}
             </div>
 
-            {/* Crop */}
+            {/* ── Crop ─────────────────────────────────────────────── */}
             <div className="glass rounded-xl overflow-hidden">
               <button
                 onClick={() => setEnableCrop(!enableCrop)}
@@ -295,9 +460,7 @@ export default function VideoEditor() {
                   <p className="text-sm font-medium text-foreground">Crop</p>
                   <p className="text-xs text-muted-foreground">Cut a custom region of the video</p>
                 </div>
-                <div className={cn('w-10 h-5 rounded-full transition-colors relative', enableCrop ? 'bg-violet-600' : 'bg-muted')}>
-                  <div className={cn('absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all', enableCrop ? 'left-5' : 'left-0.5')} />
-                </div>
+                <ToggleSwitch enabled={enableCrop} />
               </button>
               {enableCrop && (
                 <div className="px-4 pb-4 border-t border-border/50 pt-4 space-y-3">
@@ -344,13 +507,13 @@ export default function VideoEditor() {
                     </div>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    Crops a {cropWidth}×{cropHeight}px region starting at ({cropX}, {cropY})
+                    Crops a {cropWidth}&times;{cropHeight}px region starting at ({cropX}, {cropY})
                   </p>
                 </div>
               )}
             </div>
 
-            {/* Resize */}
+            {/* ── Resize ───────────────────────────────────────────── */}
             <div className="glass rounded-xl overflow-hidden">
               <button
                 onClick={() => setEnableResize(!enableResize)}
@@ -363,9 +526,7 @@ export default function VideoEditor() {
                   <p className="text-sm font-medium text-foreground">Resize</p>
                   <p className="text-xs text-muted-foreground">Change video dimensions</p>
                 </div>
-                <div className={cn('w-10 h-5 rounded-full transition-colors relative', enableResize ? 'bg-violet-600' : 'bg-muted')}>
-                  <div className={cn('absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all', enableResize ? 'left-5' : 'left-0.5')} />
-                </div>
+                <ToggleSwitch enabled={enableResize} />
               </button>
               {enableResize && (
                 <div className="px-4 pb-4 border-t border-border/50 pt-4 space-y-3">
@@ -411,7 +572,7 @@ export default function VideoEditor() {
               )}
             </div>
 
-            {/* Compress */}
+            {/* ── Compress ─────────────────────────────────────────── */}
             <div className="glass rounded-xl overflow-hidden">
               <button
                 onClick={() => setEnableCompress(!enableCompress)}
@@ -424,9 +585,7 @@ export default function VideoEditor() {
                   <p className="text-sm font-medium text-foreground">Compress</p>
                   <p className="text-xs text-muted-foreground">Reduce file size</p>
                 </div>
-                <div className={cn('w-10 h-5 rounded-full transition-colors relative', enableCompress ? 'bg-violet-600' : 'bg-muted')}>
-                  <div className={cn('absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all', enableCompress ? 'left-5' : 'left-0.5')} />
-                </div>
+                <ToggleSwitch enabled={enableCompress} />
               </button>
               {enableCompress && (
                 <div className="px-4 pb-4 border-t border-border/50 pt-4 space-y-4">
@@ -470,10 +629,478 @@ export default function VideoEditor() {
                 </div>
               )}
             </div>
+
+            {/* ── Filters ──────────────────────────────────────────── */}
+            <div className="glass rounded-xl overflow-hidden">
+              <button
+                onClick={() => setEnableFilters(!enableFilters)}
+                className="w-full flex items-center gap-3 p-4 hover:bg-white/3 transition-colors"
+              >
+                <div className={cn('w-8 h-8 rounded-lg flex items-center justify-center', enableFilters ? 'bg-violet-500/20 text-violet-400' : 'bg-white/5 text-muted-foreground')}>
+                  <SlidersHorizontal className="w-4 h-4" />
+                </div>
+                <div className="flex-1 text-left">
+                  <p className="text-sm font-medium text-foreground">Filters</p>
+                  <p className="text-xs text-muted-foreground">Adjust brightness, contrast, saturation & hue</p>
+                </div>
+                <ToggleSwitch enabled={enableFilters} />
+              </button>
+              {enableFilters && (
+                <div className="border-t border-border/50 pt-4 pb-4 px-4 space-y-4">
+                  {/* Brightness */}
+                  <div>
+                    <div className="flex justify-between text-xs text-muted-foreground mb-1">
+                      <span>Brightness</span>
+                      <span>{brightness.toFixed(2)}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={-1}
+                      max={1}
+                      step={0.01}
+                      value={brightness}
+                      onChange={(e) => setBrightness(parseFloat(e.target.value))}
+                      className="w-full accent-violet-500"
+                    />
+                    <div className="flex justify-between text-xs text-muted-foreground mt-1">
+                      <span>-1</span>
+                      <span>0</span>
+                      <span>+1</span>
+                    </div>
+                  </div>
+                  {/* Contrast */}
+                  <div>
+                    <div className="flex justify-between text-xs text-muted-foreground mb-1">
+                      <span>Contrast</span>
+                      <span>{contrast.toFixed(2)}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={3}
+                      step={0.01}
+                      value={contrast}
+                      onChange={(e) => setContrast(parseFloat(e.target.value))}
+                      className="w-full accent-violet-500"
+                    />
+                    <div className="flex justify-between text-xs text-muted-foreground mt-1">
+                      <span>0</span>
+                      <span>1</span>
+                      <span>3</span>
+                    </div>
+                  </div>
+                  {/* Saturation */}
+                  <div>
+                    <div className="flex justify-between text-xs text-muted-foreground mb-1">
+                      <span>Saturation</span>
+                      <span>{saturation.toFixed(2)}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={3}
+                      step={0.01}
+                      value={saturation}
+                      onChange={(e) => setSaturation(parseFloat(e.target.value))}
+                      className="w-full accent-violet-500"
+                    />
+                    <div className="flex justify-between text-xs text-muted-foreground mt-1">
+                      <span>0</span>
+                      <span>1</span>
+                      <span>3</span>
+                    </div>
+                  </div>
+                  {/* Hue */}
+                  <div>
+                    <div className="flex justify-between text-xs text-muted-foreground mb-1">
+                      <span>Hue</span>
+                      <span>{hue}&deg;</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={-180}
+                      max={180}
+                      step={1}
+                      value={hue}
+                      onChange={(e) => setHue(parseInt(e.target.value))}
+                      className="w-full accent-violet-500"
+                    />
+                    <div className="flex justify-between text-xs text-muted-foreground mt-1">
+                      <span>-180&deg;</span>
+                      <span>0&deg;</span>
+                      <span>+180&deg;</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* ── Speed ────────────────────────────────────────────── */}
+            <div className="glass rounded-xl overflow-hidden">
+              <button
+                onClick={() => setEnableSpeed(!enableSpeed)}
+                className="w-full flex items-center gap-3 p-4 hover:bg-white/3 transition-colors"
+              >
+                <div className={cn('w-8 h-8 rounded-lg flex items-center justify-center', enableSpeed ? 'bg-violet-500/20 text-violet-400' : 'bg-white/5 text-muted-foreground')}>
+                  <Zap className="w-4 h-4" />
+                </div>
+                <div className="flex-1 text-left">
+                  <p className="text-sm font-medium text-foreground">Speed</p>
+                  <p className="text-xs text-muted-foreground">Change playback speed</p>
+                </div>
+                <ToggleSwitch enabled={enableSpeed} />
+              </button>
+              {enableSpeed && (
+                <div className="border-t border-border/50 pt-4 pb-4 px-4">
+                  <label className="text-xs text-muted-foreground mb-2 block">Playback Rate</label>
+                  <div className="flex gap-2 flex-wrap">
+                    {SPEED_RATES.map((rate) => (
+                      <button
+                        key={rate}
+                        onClick={() => setSpeedRate(rate)}
+                        className={cn(
+                          'px-4 py-2 rounded-lg text-sm font-medium border transition-all',
+                          speedRate === rate
+                            ? 'border-violet-500/60 bg-violet-500/10 text-violet-400'
+                            : 'border-border text-muted-foreground hover:border-white/20'
+                        )}
+                      >
+                        {rate}x
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* ── Rotate & Flip ─────────────────────────────────────── */}
+            <div className="glass rounded-xl overflow-hidden">
+              <button
+                onClick={() => setEnableRotate(!enableRotate)}
+                className="w-full flex items-center gap-3 p-4 hover:bg-white/3 transition-colors"
+              >
+                <div className={cn('w-8 h-8 rounded-lg flex items-center justify-center', enableRotate ? 'bg-violet-500/20 text-violet-400' : 'bg-white/5 text-muted-foreground')}>
+                  <RotateCw className="w-4 h-4" />
+                </div>
+                <div className="flex-1 text-left">
+                  <p className="text-sm font-medium text-foreground">Rotate &amp; Flip</p>
+                  <p className="text-xs text-muted-foreground">Rotate or mirror the video</p>
+                </div>
+                <ToggleSwitch enabled={enableRotate} />
+              </button>
+              {enableRotate && (
+                <div className="border-t border-border/50 pt-4 pb-4 px-4 space-y-3">
+                  <div>
+                    <label className="text-xs text-muted-foreground mb-2 block">Rotation</label>
+                    <div className="flex gap-2 flex-wrap">
+                      <button
+                        onClick={() => setRotateAngle((prev) => { const next = ((prev - 90 + 360) % 360) as 0 | 90 | 180 | 270; return next; })}
+                        className="px-3 py-2 rounded-lg text-sm font-medium border border-border text-muted-foreground hover:border-white/20 transition-all"
+                        title="90° Counter-Clockwise"
+                      >
+                        &#8634;90&deg; CCW
+                      </button>
+                      <button
+                        onClick={() => setRotateAngle((prev) => ((prev + 90) % 360) as 0 | 90 | 180 | 270)}
+                        className="px-3 py-2 rounded-lg text-sm font-medium border border-border text-muted-foreground hover:border-white/20 transition-all"
+                        title="90° Clockwise"
+                      >
+                        &#8635;90&deg; CW
+                      </button>
+                      <button
+                        onClick={() => setFlipH((v) => !v)}
+                        className={cn(
+                          'px-3 py-2 rounded-lg text-sm font-medium border transition-all',
+                          flipH
+                            ? 'border-violet-500/60 bg-violet-500/10 text-violet-400'
+                            : 'border-border text-muted-foreground hover:border-white/20'
+                        )}
+                        title="Flip Horizontal"
+                      >
+                        &#8596; Flip H
+                      </button>
+                      <button
+                        onClick={() => setFlipV((v) => !v)}
+                        className={cn(
+                          'px-3 py-2 rounded-lg text-sm font-medium border transition-all',
+                          flipV
+                            ? 'border-violet-500/60 bg-violet-500/10 text-violet-400'
+                            : 'border-border text-muted-foreground hover:border-white/20'
+                        )}
+                        title="Flip Vertical"
+                      >
+                        &#8597; Flip V
+                      </button>
+                    </div>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Current angle: {rotateAngle}&deg;{flipH ? ' · Flipped H' : ''}{flipV ? ' · Flipped V' : ''}
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {/* ── Mute Audio ───────────────────────────────────────── */}
+            <div className="glass rounded-xl overflow-hidden">
+              <button
+                onClick={() => setEnableMute(!enableMute)}
+                className="w-full flex items-center gap-3 p-4 hover:bg-white/3 transition-colors"
+              >
+                <div className={cn('w-8 h-8 rounded-lg flex items-center justify-center', enableMute ? 'bg-violet-500/20 text-violet-400' : 'bg-white/5 text-muted-foreground')}>
+                  <VolumeX className="w-4 h-4" />
+                </div>
+                <div className="flex-1 text-left">
+                  <p className="text-sm font-medium text-foreground">Mute Audio</p>
+                  <p className="text-xs text-muted-foreground">Remove audio track from output</p>
+                </div>
+                <ToggleSwitch enabled={enableMute} />
+              </button>
+              {enableMute && (
+                <div className="border-t border-border/50 pt-4 pb-4 px-4">
+                  <p className="text-xs text-muted-foreground">
+                    Audio will be stripped from the output file. The video track is preserved.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {/* ── Reverse Video ─────────────────────────────────────── */}
+            <div className="glass rounded-xl overflow-hidden">
+              <button
+                onClick={() => setEnableReverse(!enableReverse)}
+                className="w-full flex items-center gap-3 p-4 hover:bg-white/3 transition-colors"
+              >
+                <div className={cn('w-8 h-8 rounded-lg flex items-center justify-center', enableReverse ? 'bg-violet-500/20 text-violet-400' : 'bg-white/5 text-muted-foreground')}>
+                  <Rewind className="w-4 h-4" />
+                </div>
+                <div className="flex-1 text-left">
+                  <p className="text-sm font-medium text-foreground">Reverse Video</p>
+                  <p className="text-xs text-muted-foreground">Play video in reverse</p>
+                </div>
+                <ToggleSwitch enabled={enableReverse} />
+              </button>
+              {enableReverse && (
+                <div className="border-t border-border/50 pt-4 pb-4 px-4">
+                  <p className="text-xs text-muted-foreground">
+                    Video and audio will be reversed. Note: reversal requires full re-encode and may be slow for large files.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {/* ── Watermark ────────────────────────────────────────── */}
+            <div className="glass rounded-xl overflow-hidden">
+              <button
+                onClick={() => setEnableWatermark(!enableWatermark)}
+                className="w-full flex items-center gap-3 p-4 hover:bg-white/3 transition-colors"
+              >
+                <div className={cn('w-8 h-8 rounded-lg flex items-center justify-center', enableWatermark ? 'bg-violet-500/20 text-violet-400' : 'bg-white/5 text-muted-foreground')}>
+                  <Type className="w-4 h-4" />
+                </div>
+                <div className="flex-1 text-left">
+                  <p className="text-sm font-medium text-foreground">Watermark</p>
+                  <p className="text-xs text-muted-foreground">Overlay text on the video</p>
+                </div>
+                <ToggleSwitch enabled={enableWatermark} />
+              </button>
+              {enableWatermark && (
+                <div className="border-t border-border/50 pt-4 pb-4 px-4 space-y-4">
+                  <div>
+                    <label className="text-xs text-muted-foreground mb-1 block">Watermark Text</label>
+                    <input
+                      type="text"
+                      placeholder="Enter watermark text..."
+                      value={watermarkText}
+                      onChange={(e) => setWatermarkText(e.target.value)}
+                      className="w-full bg-white/5 border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-violet-500/50"
+                    />
+                  </div>
+                  <div>
+                    <div className="flex justify-between text-xs text-muted-foreground mb-1">
+                      <span>Font Size</span>
+                      <span>{watermarkFontSize}px</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={12}
+                      max={80}
+                      step={1}
+                      value={watermarkFontSize}
+                      onChange={(e) => setWatermarkFontSize(parseInt(e.target.value))}
+                      className="w-full accent-violet-500"
+                    />
+                    <div className="flex justify-between text-xs text-muted-foreground mt-1">
+                      <span>12px</span>
+                      <span>80px</span>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-xs text-muted-foreground mb-1 block">Text Color</label>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="color"
+                          value={watermarkColor}
+                          onChange={(e) => setWatermarkColor(e.target.value)}
+                          className="w-10 h-9 rounded-lg border border-border bg-white/5 cursor-pointer p-0.5"
+                        />
+                        <span className="text-sm text-muted-foreground font-mono">{watermarkColor}</span>
+                      </div>
+                    </div>
+                    <div>
+                      <label className="text-xs text-muted-foreground mb-1 block">Position</label>
+                      <select
+                        value={watermarkPosition}
+                        onChange={(e) => setWatermarkPosition(e.target.value as WatermarkOptions['position'])}
+                        className="w-full bg-white/5 border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-violet-500/50"
+                      >
+                        {WATERMARK_POSITIONS.map((p) => (
+                          <option key={p.value} value={p.value}>{p.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* ── Extract Audio (mode) ──────────────────────────────── */}
+            <div className="glass rounded-xl overflow-hidden">
+              <button
+                onClick={() => setOperationMode(operationMode === 'extract-audio' ? 'video' : 'extract-audio')}
+                className="w-full flex items-center gap-3 p-4 hover:bg-white/3 transition-colors"
+              >
+                <div className={cn('w-8 h-8 rounded-lg flex items-center justify-center', operationMode === 'extract-audio' ? 'bg-violet-500/20 text-violet-400' : 'bg-white/5 text-muted-foreground')}>
+                  <Music className="w-4 h-4" />
+                </div>
+                <div className="flex-1 text-left">
+                  <p className="text-sm font-medium text-foreground">Extract Audio</p>
+                  <p className="text-xs text-muted-foreground">Save audio track as MP3 or AAC</p>
+                </div>
+                <ToggleSwitch enabled={operationMode === 'extract-audio'} />
+              </button>
+              {operationMode === 'extract-audio' && (
+                <div className="border-t border-border/50 pt-4 pb-4 px-4 space-y-3">
+                  <p className="text-xs text-amber-400/80">
+                    Extract Audio mode is active. Other video operations will be ignored. The Process button will extract audio only.
+                  </p>
+                  <div>
+                    <label className="text-xs text-muted-foreground mb-2 block">Audio Format</label>
+                    <div className="flex gap-3">
+                      {(['mp3', 'aac'] as const).map((fmt) => (
+                        <label key={fmt} className="flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="radio"
+                            name="audioFormat"
+                            value={fmt}
+                            checked={audioFormat === fmt}
+                            onChange={() => setAudioFormat(fmt)}
+                            className="accent-violet-500"
+                          />
+                          <span className="text-sm text-foreground uppercase">{fmt}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* ── Video to GIF (mode) ───────────────────────────────── */}
+            <div className="glass rounded-xl overflow-hidden">
+              <button
+                onClick={() => setOperationMode(operationMode === 'gif' ? 'video' : 'gif')}
+                className="w-full flex items-center gap-3 p-4 hover:bg-white/3 transition-colors"
+              >
+                <div className={cn('w-8 h-8 rounded-lg flex items-center justify-center', operationMode === 'gif' ? 'bg-violet-500/20 text-violet-400' : 'bg-white/5 text-muted-foreground')}>
+                  <ImageIcon className="w-4 h-4" />
+                </div>
+                <div className="flex-1 text-left">
+                  <p className="text-sm font-medium text-foreground">Video to GIF</p>
+                  <p className="text-xs text-muted-foreground">Convert video clip to animated GIF</p>
+                </div>
+                <ToggleSwitch enabled={operationMode === 'gif'} />
+              </button>
+              {operationMode === 'gif' && (
+                <div className="border-t border-border/50 pt-4 pb-4 px-4 space-y-4">
+                  <p className="text-xs text-amber-400/80">
+                    GIF mode is active. Other video operations will be ignored. The Process button will generate a GIF.
+                  </p>
+                  {/* FPS */}
+                  <div>
+                    <div className="flex justify-between text-xs text-muted-foreground mb-1">
+                      <span>Frame Rate</span>
+                      <span>{gifFps} fps</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={5}
+                      max={30}
+                      step={1}
+                      value={gifFps}
+                      onChange={(e) => setGifFps(parseInt(e.target.value))}
+                      className="w-full accent-violet-500"
+                    />
+                    <div className="flex justify-between text-xs text-muted-foreground mt-1">
+                      <span>5 fps</span>
+                      <span>30 fps</span>
+                    </div>
+                  </div>
+                  {/* Width */}
+                  <div>
+                    <div className="flex justify-between text-xs text-muted-foreground mb-1">
+                      <span>Width</span>
+                      <span>{gifWidth}px</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={240}
+                      max={640}
+                      step={10}
+                      value={gifWidth}
+                      onChange={(e) => setGifWidth(parseInt(e.target.value))}
+                      className="w-full accent-violet-500"
+                    />
+                    <div className="flex justify-between text-xs text-muted-foreground mt-1">
+                      <span>240px</span>
+                      <span>640px</span>
+                    </div>
+                  </div>
+                  {/* Optional start/duration */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-xs text-muted-foreground mb-1 block">Start Time (s, optional)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        step={0.1}
+                        placeholder="e.g. 2.5"
+                        value={gifStart}
+                        onChange={(e) => setGifStart(e.target.value)}
+                        className="w-full bg-white/5 border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-violet-500/50"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-muted-foreground mb-1 block">Duration (s, optional)</label>
+                      <input
+                        type="number"
+                        min={0.1}
+                        step={0.1}
+                        placeholder="e.g. 5"
+                        value={gifDuration}
+                        onChange={(e) => setGifDuration(e.target.value)}
+                        className="w-full bg-white/5 border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-violet-500/50"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
           </div>
 
           {/* Error */}
-          {state === 'error' && (
+          {(state === 'error' || (state === 'idle' && error)) && error && (
             <div className="flex items-start gap-3 glass rounded-xl p-4 border border-red-500/30 text-red-400">
               <AlertCircle className="w-5 h-5 mt-0.5 flex-shrink-0" />
               <p className="text-sm">{error}</p>
@@ -486,7 +1113,7 @@ export default function VideoEditor() {
               <div className="flex items-center gap-3">
                 <Loader2 className="w-5 h-5 text-violet-400 animate-spin" />
                 <p className="text-sm font-medium">
-                  {state === 'loading-ffmpeg' ? 'Loading FFmpeg engine...' : `Processing video... ${progress}%`}
+                  {state === 'loading-ffmpeg' ? 'Loading FFmpeg engine...' : `Processing... ${progress}%`}
                 </p>
               </div>
               <div className="w-full bg-muted rounded-full h-2 overflow-hidden">
@@ -529,7 +1156,7 @@ export default function VideoEditor() {
               className="w-full py-3.5 bg-gradient-to-r from-violet-600 to-purple-600 hover:from-violet-500 hover:to-purple-500 text-white font-semibold rounded-xl flex items-center justify-center gap-2 shadow-lg shadow-violet-600/20 transition-all"
             >
               <Play className="w-4 h-4" />
-              Process Video
+              {processButtonLabel()}
             </button>
           )}
         </>

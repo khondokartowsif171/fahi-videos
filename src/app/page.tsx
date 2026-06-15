@@ -1,5 +1,17 @@
 import Link from 'next/link';
-import { Download, Video, ImageIcon, CheckCircle2, Zap, Shield, Infinity } from 'lucide-react';
+import {
+  Download,
+  Video,
+  ImageIcon,
+  CheckCircle2,
+  Zap,
+  Shield,
+  Infinity,
+  Film,
+  Monitor,
+  FileImage,
+  Music,
+} from 'lucide-react';
 
 const features = [
   {
@@ -16,7 +28,7 @@ const features = [
     icon: Video,
     title: 'Video Editor',
     description:
-      'Trim, resize, and compress your videos directly in the browser. Powered by FFmpeg — no uploads to any server.',
+      'Trim, resize, compress, add filters, speed control, rotate, watermark, reverse and more — all in the browser.',
     color: 'from-violet-500 to-purple-600',
     badge: 'In Browser',
   },
@@ -25,9 +37,45 @@ const features = [
     icon: ImageIcon,
     title: 'Image Editor',
     description:
-      'Resize, crop, rotate, apply filters, and add text to images. Export as PNG, JPG, or WebP instantly.',
+      'Crop, resize, rotate, apply filters, add text, remove background, and export as PNG, JPG, or WebP.',
     color: 'from-cyan-500 to-blue-600',
     badge: 'Instant',
+  },
+  {
+    href: '/gif-maker',
+    icon: Film,
+    title: 'GIF Maker',
+    description:
+      'Convert any video clip to an animated GIF. Control FPS, quality, and size — no server uploads.',
+    color: 'from-pink-500 to-rose-600',
+    badge: 'New',
+  },
+  {
+    href: '/screen-recorder',
+    icon: Monitor,
+    title: 'Screen Recorder',
+    description:
+      'Record your screen, window, or tab directly in the browser. Save as WebM video instantly.',
+    color: 'from-green-500 to-emerald-600',
+    badge: 'New',
+  },
+  {
+    href: '/image-compressor',
+    icon: FileImage,
+    title: 'Image Compressor',
+    description:
+      'Batch compress images with a quality slider. Download individually or as a ZIP — no size limits.',
+    color: 'from-amber-500 to-yellow-600',
+    badge: 'New',
+  },
+  {
+    href: '/video-to-mp3',
+    icon: Music,
+    title: 'Video to MP3',
+    description:
+      'Extract audio from any video file. Download as MP3 or AAC — powered by FFmpeg in your browser.',
+    color: 'from-sky-500 to-indigo-600',
+    badge: 'New',
   },
 ];
 
@@ -45,17 +93,17 @@ export default function Home() {
       <div className="max-w-6xl mx-auto px-4 sm:px-6 pt-24 pb-16 text-center">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-violet-500/30 bg-violet-500/10 text-violet-400 text-sm font-medium mb-6">
           <Zap className="w-3.5 h-3.5" />
-          Free · No account required
+          Free · No account required · 7 tools
         </div>
         <h1 className="text-4xl sm:text-6xl font-extrabold tracking-tight mb-6">
           <span className="text-violet-400">Fahi</span> Video
           <br />
           <span className="text-2xl sm:text-4xl text-muted-foreground font-medium">
-            Downloader & Editing
+            Downloader & Editing Suite
           </span>
         </h1>
         <p className="text-lg text-muted-foreground max-w-2xl mx-auto mb-10">
-          Download YouTube videos, edit videos & images — all for free, right in your browser.
+          Download YouTube videos, edit videos &amp; images — all for free, right in your browser.
           No signup. No watermarks. Nothing to install.
         </p>
 
@@ -70,7 +118,7 @@ export default function Home() {
         </div>
 
         {/* Feature cards */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
           {features.map(({ href, icon: Icon, title, description, color, badge }) => (
             <Link
               key={href}
