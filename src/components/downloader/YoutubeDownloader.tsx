@@ -1,8 +1,10 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import Image from 'next/image';
 import { Search, Download, AlertCircle, Clock, Eye, Music, Video } from 'lucide-react';
+import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { fetchFile } from '@ffmpeg/util';
 import { cn, formatDuration, formatFileSize, triggerDownload, sanitizeFilename } from '@/lib/utils';
 import type { VideoInfo, VideoFormat, FetchState } from '@/types/youtube';
 
@@ -12,6 +14,9 @@ export default function YoutubeDownloader() {
   const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null);
   const [selectedFormat, setSelectedFormat] = useState<VideoFormat | null>(null);
   const [error, setError] = useState('');
+  const [merging, setMerging] = useState(false);
+  const [mergeProgress, setMergeProgress] = useState(0);
+  const ffmpegRef = useRef<FFmpeg | null>(null);
 
   const handleFetch = async () => {
     if (!url.trim()) return;
@@ -33,12 +38,45 @@ export default function YoutubeDownloader() {
     }
   };
 
-  const handleDownload = () => {
+  const handleDownload = async () => {
     if (!selectedFormat || !videoInfo) return;
-    triggerDownload(
-      selectedFormat.url,
-      `${sanitizeFilename(videoInfo.title)}.${selectedFormat.container}`
-    );
+
+    if (selectedFormat.hasVideo && !selectedFormat.hasAudio && selectedFormat.audioUrl) {
+      setMerging(true);
+      setMergeProgress(0);
+      try {
+        let ff = ffmpegRef.current;
+        if (!ff) {
+          ff = new FFmpeg();
+          await ff.load();
+          ffmpegRef.current = ff;
+        }
+        setMergeProgress(10);
+        await ff.writeFile('v.mp4', await fetchFile(selectedFormat.url));
+        setMergeProgress(45);
+        await ff.writeFile('a.m4a', await fetchFile(selectedFormat.audioUrl));
+        setMergeProgress(75);
+        await ff.exec(['-i', 'v.mp4', '-i', 'a.m4a', '-c', 'copy', 'out.mp4']);
+        setMergeProgress(95);
+        const rawData = await ff.readFile('out.mp4');
+        const blob = new Blob([(rawData as Uint8Array).slice()], { type: 'video/mp4' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `${sanitizeFilename(videoInfo.title)}.mp4`;
+        a.click();
+        setMergeProgress(100);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Merge failed');
+        setState('error');
+      } finally {
+        setMerging(false);
+      }
+    } else {
+      triggerDownload(
+        selectedFormat.url,
+        `${sanitizeFilename(videoInfo.title)}.${selectedFormat.container}`
+      );
+    }
   };
 
   return (
@@ -153,27 +191,54 @@ export default function YoutubeDownloader() {
                         <Music className="w-3 h-3 flex-shrink-0" />
                       )}
                       <span className="font-medium truncate">{fmt.qualityLabel}</span>
+                      {fmt.hasVideo && !fmt.hasAudio && (
+                        <span className="ml-auto text-[10px] font-bold bg-violet-500/20 text-violet-400 px-1 py-0.5 rounded flex-shrink-0">HD</span>
+                      )}
                     </div>
                     <div className="text-xs opacity-60 truncate">
                       {fmt.container.toUpperCase()} · {formatFileSize(fmt.contentLength)}
+                      {fmt.hasVideo && !fmt.hasAudio && ' · +audio'}
                     </div>
                   </button>
                 ))}
               </div>
             </div>
 
-            {/* Download button */}
-            <button
-              onClick={handleDownload}
-              disabled={!selectedFormat}
-              className="w-full py-3 px-6 bg-gradient-to-r from-violet-600 to-purple-600 hover:from-violet-500 hover:to-purple-500 text-white font-medium rounded-xl flex items-center justify-center gap-2 shadow-lg shadow-violet-600/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <Download className="w-4 h-4" />
-              Download {selectedFormat?.qualityLabel}
-            </button>
+            {/* Download / Merge button */}
+            {merging ? (
+              <div className="space-y-2">
+                <div className="w-full bg-white/10 rounded-full h-2 overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-violet-500 to-purple-500 transition-all duration-300 rounded-full"
+                    style={{ width: `${mergeProgress}%` }}
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground text-center">
+                  {mergeProgress < 10 ? 'Loading FFmpeg...' :
+                   mergeProgress < 45 ? 'Downloading video...' :
+                   mergeProgress < 75 ? 'Downloading audio...' :
+                   mergeProgress < 95 ? 'Merging streams...' :
+                   'Finalizing...'}
+                  {' '}{mergeProgress}%
+                </p>
+              </div>
+            ) : (
+              <button
+                onClick={handleDownload}
+                disabled={!selectedFormat}
+                className="w-full py-3 px-6 bg-gradient-to-r from-violet-600 to-purple-600 hover:from-violet-500 hover:to-purple-500 text-white font-medium rounded-xl flex items-center justify-center gap-2 shadow-lg shadow-violet-600/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Download className="w-4 h-4" />
+                {selectedFormat?.hasVideo && !selectedFormat?.hasAudio
+                  ? `Download & Merge ${selectedFormat?.qualityLabel}`
+                  : `Download ${selectedFormat?.qualityLabel}`}
+              </button>
+            )}
 
             <p className="text-xs text-muted-foreground text-center">
-              Download starts in a new tab. For personal use only.
+              {selectedFormat?.hasVideo && !selectedFormat?.hasAudio
+                ? 'HD formats are merged client-side in your browser.'
+                : 'Download starts in a new tab. For personal use only.'}
             </p>
           </div>
         </div>
