@@ -10,6 +10,10 @@ RUN npm run build
 FROM node:20-alpine AS runner
 WORKDIR /app
 
+# Tell Traefik to use plain HTTP when connecting to this container (not HTTPS)
+LABEL traefik.http.services.https-0-zux6wi3woofim4nhmnpm4w4h.loadbalancer.server.scheme=http
+LABEL traefik.http.services.http-0-zux6wi3woofim4nhmnpm4w4h.loadbalancer.server.scheme=http
+
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV HOSTNAME="0.0.0.0"
