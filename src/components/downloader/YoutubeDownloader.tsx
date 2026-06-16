@@ -52,9 +52,12 @@ export default function YoutubeDownloader() {
           ffmpegRef.current = ff;
         }
         setMergeProgress(10);
-        await ff.writeFile('v.mp4', await fetchFile(selectedFormat.url));
+        // Route through proxy so COEP (require-corp) doesn't block the cross-origin fetch
+        const videoProxyUrl = `/api/youtube/proxy?url=${encodeURIComponent(selectedFormat.url)}&filename=v.mp4`;
+        const audioProxyUrl = `/api/youtube/proxy?url=${encodeURIComponent(selectedFormat.audioUrl)}&filename=a.m4a`;
+        await ff.writeFile('v.mp4', await fetchFile(videoProxyUrl));
         setMergeProgress(45);
-        await ff.writeFile('a.m4a', await fetchFile(selectedFormat.audioUrl));
+        await ff.writeFile('a.m4a', await fetchFile(audioProxyUrl));
         setMergeProgress(75);
         await ff.exec(['-i', 'v.mp4', '-i', 'a.m4a', '-c', 'copy', 'out.mp4']);
         setMergeProgress(95);
@@ -72,10 +75,11 @@ export default function YoutubeDownloader() {
         setMerging(false);
       }
     } else {
-      triggerDownload(
-        selectedFormat.url,
-        `${sanitizeFilename(videoInfo.title)}.${selectedFormat.container}`
-      );
+      // Route download through our proxy so the browser treats it as same-origin,
+      // making the `download` attribute work (cross-origin hrefs are ignored by browsers).
+      const safeFilename = `${sanitizeFilename(videoInfo.title)}.${selectedFormat.container}`;
+      const proxyUrl = `/api/youtube/proxy?url=${encodeURIComponent(selectedFormat.url)}&filename=${encodeURIComponent(safeFilename)}`;
+      triggerDownload(proxyUrl, safeFilename);
     }
   };
 
