@@ -23,9 +23,7 @@ function extractVideoId(url: string): string | null {
   }
 }
 
-// TV_EMBEDDED first — works on cloud IPs without a PO token.
-// ANDROID / IOS as fallbacks for muxed direct URLs.
-const CLIENTS = ['TV_EMBEDDED', 'ANDROID', 'IOS', 'WEB'] as const;
+const CLIENTS = ['TV_EMBEDDED', 'TV', 'TV_SIMPLY', 'MWEB', 'WEB_CREATOR', 'WEB_EMBEDDED', 'ANDROID', 'IOS', 'WEB'] as const;
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -41,21 +39,46 @@ export async function GET(request: Request) {
   }
 
   try {
-    const yt = await Innertube.create({
-      cache: undefined,
-      generate_session_locally: true,
-    });
-
     let info: any = null;
-    for (const client of CLIENTS) {
-      try {
-        const candidate = await yt.getInfo(videoId, { client });
-        if (candidate.streaming_data) {
-          info = candidate;
-          break;
+    let player: any = null;
+
+    // Pass 1: generate session locally (fast, no extra network call)
+    try {
+      const yt = await Innertube.create({ cache: undefined, generate_session_locally: true });
+      for (const client of CLIENTS) {
+        try {
+          const candidate = await yt.getInfo(videoId, { client });
+          if (candidate.streaming_data) {
+            info = candidate;
+            player = yt.session.player;
+            break;
+          }
+        } catch (e) {
+          console.error(`[yt] client=${client} local=true:`, e instanceof Error ? e.message : e);
         }
-      } catch {
-        // try next client
+      }
+    } catch (e) {
+      console.error('[yt] Pass 1 init failed:', e instanceof Error ? e.message : e);
+    }
+
+    // Pass 2: fetch real visitor_data from YouTube (more authentic session for cloud IPs)
+    if (!info) {
+      try {
+        const yt2 = await Innertube.create({ cache: undefined, generate_session_locally: false });
+        for (const client of ['TV_EMBEDDED', 'TV', 'TV_SIMPLY', 'MWEB'] as const) {
+          try {
+            const candidate = await yt2.getInfo(videoId, { client });
+            if (candidate.streaming_data) {
+              info = candidate;
+              player = yt2.session.player;
+              break;
+            }
+          } catch (e) {
+            console.error(`[yt] client=${client} local=false:`, e instanceof Error ? e.message : e);
+          }
+        }
+      } catch (e) {
+        console.error('[yt] Pass 2 init failed:', e instanceof Error ? e.message : e);
       }
     }
 
@@ -68,7 +91,6 @@ export async function GET(request: Request) {
 
     const basic = info.basic_info;
     const streamingData = info.streaming_data;
-    const player = yt.session.player;
 
     // decipher() must be called first — it transforms the obfuscated n-parameter
     // so YouTube doesn't return 403. f.url is the raw (broken) URL.
