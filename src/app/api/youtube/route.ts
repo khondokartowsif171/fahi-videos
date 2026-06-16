@@ -1,9 +1,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from 'next/server';
-import { Innertube } from 'youtubei.js';
 
-export const runtime = 'nodejs';
-export const maxDuration = 30;
+// Edge runtime runs on Cloudflare's network — different IPs from Vercel serverless (AWS Lambda).
+// YouTube blocks Lambda IPs; Cloudflare edge IPs work.
+export const runtime = 'edge';
 
 function extractVideoId(url: string): string | null {
   try {
@@ -23,7 +23,92 @@ function extractVideoId(url: string): string | null {
   }
 }
 
-const CLIENTS = ['TV_EMBEDDED', 'TV', 'TV_SIMPLY', 'MWEB', 'WEB_CREATOR', 'WEB_EMBEDDED', 'ANDROID', 'IOS', 'WEB'] as const;
+const CLIENTS = [
+  {
+    name: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+    version: '2.0',
+    id: '85',
+    ua: 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1',
+    embedUrl: 'https://www.youtube.com/',
+  },
+  {
+    name: 'TV_EMBEDDED',
+    version: '2.0',
+    id: '85',
+    ua: 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1',
+    embedUrl: 'https://www.youtube.com/',
+  },
+  {
+    name: 'MWEB',
+    version: '2.20260205.04.01',
+    id: '2',
+    ua: 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+    embedUrl: null,
+  },
+  {
+    name: 'WEB',
+    version: '2.20260206.01.00',
+    id: '1',
+    ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    embedUrl: null,
+  },
+] as const;
+
+async function tryClient(videoId: string, c: (typeof CLIENTS)[number]): Promise<any> {
+  const body: any = {
+    videoId,
+    racyCheckOk: true,
+    contentCheckOk: true,
+    context: {
+      client: {
+        clientName: c.name,
+        clientVersion: c.version,
+        hl: 'en',
+        gl: 'US',
+        utcOffsetMinutes: 0,
+      },
+      ...(c.embedUrl ? { thirdParty: { embedUrl: c.embedUrl } } : {}),
+    },
+  };
+
+  try {
+    const res = await fetch(
+      'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-YouTube-Client-Name': c.id,
+          'X-YouTube-Client-Version': c.version,
+          'Origin': 'https://www.youtube.com',
+          'Referer': `https://www.youtube.com/watch?v=${videoId}`,
+          'User-Agent': c.ua,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(7000),
+      }
+    );
+
+    if (!res.ok) {
+      console.error(`[yt-edge] ${c.name} HTTP ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json();
+
+    if (data?.playabilityStatus?.status === 'OK' && data?.streamingData) {
+      return data;
+    }
+
+    console.error(
+      `[yt-edge] ${c.name} status=${data?.playabilityStatus?.status} reason=${data?.playabilityStatus?.reason ?? ''}`
+    );
+    return null;
+  } catch (e) {
+    console.error(`[yt-edge] ${c.name} threw:`, e instanceof Error ? e.message : e);
+    return null;
+  }
+}
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -39,155 +124,94 @@ export async function GET(request: Request) {
   }
 
   try {
-    let info: any = null;
-    let player: any = null;
-
-    // Pass 1: generate session locally (fast, no extra network call)
-    try {
-      const yt = await Innertube.create({ cache: undefined, generate_session_locally: true });
-      for (const client of CLIENTS) {
-        try {
-          const candidate = await yt.getInfo(videoId, { client });
-          if (candidate.streaming_data) {
-            info = candidate;
-            player = yt.session.player;
-            break;
-          }
-        } catch (e) {
-          console.error(`[yt] client=${client} local=true:`, e instanceof Error ? e.message : e);
-        }
-      }
-    } catch (e) {
-      console.error('[yt] Pass 1 init failed:', e instanceof Error ? e.message : e);
+    let playerData: any = null;
+    for (const c of CLIENTS) {
+      playerData = await tryClient(videoId, c);
+      if (playerData) break;
     }
 
-    // Pass 2: fetch real visitor_data from YouTube (more authentic session for cloud IPs)
-    if (!info) {
-      try {
-        const yt2 = await Innertube.create({ cache: undefined, generate_session_locally: false });
-        for (const client of ['TV_EMBEDDED', 'TV', 'TV_SIMPLY', 'MWEB'] as const) {
-          try {
-            const candidate = await yt2.getInfo(videoId, { client });
-            if (candidate.streaming_data) {
-              info = candidate;
-              player = yt2.session.player;
-              break;
-            }
-          } catch (e) {
-            console.error(`[yt] client=${client} local=false:`, e instanceof Error ? e.message : e);
-          }
-        }
-      } catch (e) {
-        console.error('[yt] Pass 2 init failed:', e instanceof Error ? e.message : e);
-      }
-    }
-
-    if (!info?.streaming_data) {
+    if (!playerData) {
       return NextResponse.json(
         { error: 'No streaming data available for this video' },
         { status: 404 }
       );
     }
 
-    const basic = info.basic_info;
-    const streamingData = info.streaming_data;
+    const streamingData = playerData.streamingData;
 
-    // decipher() must be called first — it transforms the obfuscated n-parameter
-    // so YouTube doesn't return 403. f.url is the raw (broken) URL.
-    const resolveUrl = (f: any): string | null => {
-      try {
-        if (typeof f.decipher === 'function') {
-          const u = f.decipher(player);
-          if (typeof u === 'string' && u.startsWith('https://')) return u;
-        }
-      } catch { /* ignore */ }
-      if (typeof f.url === 'string' && f.url.startsWith('https://')) return f.url;
-      return null;
-    };
-
-    // Muxed formats (video + audio together)
+    // Only use formats with a direct `url` — skip signatureCipher entries (need JS decipher)
     const muxedFormats = (streamingData.formats ?? [])
+      .filter((f: any) => f.url && f.mimeType)
       .map((f: any) => {
-        const resolvedUrl = resolveUrl(f);
-        if (!resolvedUrl) return null;
-        const quality = f.quality_label ?? `${f.height ?? '?'}p`;
-        const container = (f.mime_type ?? 'video/mp4').split(';')[0].split('/')[1] ?? 'mp4';
+        const container = (f.mimeType as string).split(';')[0].split('/')[1] ?? 'mp4';
         return {
           itag: f.itag ?? 0,
-          qualityLabel: quality,
+          qualityLabel: f.qualityLabel ?? `${f.height ?? '?'}p`,
           container,
           hasVideo: true,
           hasAudio: true,
-          contentLength: f.content_length?.toString(),
-          url: resolvedUrl,
-          mimeType: f.mime_type ?? 'video/mp4',
+          contentLength: f.contentLength?.toString(),
+          url: f.url as string,
+          mimeType: f.mimeType as string,
           bitrate: f.bitrate,
         };
-      })
-      .filter(Boolean);
+      });
 
-    const allAdaptive: any[] = streamingData.adaptive_formats ?? [];
+    const allAdaptive: any[] = (streamingData.adaptiveFormats ?? []).filter((f: any) => f.url);
 
-    // Best audio stream for client-side merging with video-only formats
+    // Audio-only: has audioQuality, no qualityLabel (video resolution label)
     const bestAudioFmt = allAdaptive
-      .filter((f: any) => f.has_audio && !f.has_video)
+      .filter((f: any) => f.audioQuality && !f.qualityLabel)
       .sort((a: any, b: any) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
-    const bestAudioUrl = bestAudioFmt ? resolveUrl(bestAudioFmt) : null;
-    const bestAudioMime: string = bestAudioFmt?.mime_type ?? 'audio/mp4';
+    const bestAudioUrl: string | null = bestAudioFmt?.url ?? null;
 
-    // Video-only adaptive formats >= 720p (need client-side FFmpeg merge)
+    // Video-only >= 720p: has qualityLabel (e.g. "1080p"), no audioQuality
     const seenHeights = new Set<number>();
     const videoOnlyFormats = allAdaptive
-      .filter((f: any) => f.has_video && !f.has_audio && (f.height ?? 0) >= 720)
+      .filter((f: any) => f.qualityLabel && !f.audioQuality && (f.height ?? 0) >= 720)
       .sort((a: any, b: any) => (b.height ?? 0) - (a.height ?? 0))
       .map((f: any) => {
         const h: number = f.height ?? 0;
-        if (seenHeights.has(h)) return null;
+        if (seenHeights.has(h) || !bestAudioUrl) return null;
         seenHeights.add(h);
-        const resolvedUrl = resolveUrl(f);
-        if (!resolvedUrl || !bestAudioUrl) return null;
-        const container = (f.mime_type ?? 'video/mp4').split(';')[0].split('/')[1] ?? 'mp4';
+        const container = (f.mimeType as string).split(';')[0].split('/')[1] ?? 'mp4';
         return {
           itag: f.itag ?? 0,
-          qualityLabel: f.quality_label ?? `${h}p`,
+          qualityLabel: f.qualityLabel ?? `${h}p`,
           container,
           hasVideo: true,
           hasAudio: false,
-          contentLength: f.content_length?.toString(),
-          url: resolvedUrl,
-          mimeType: f.mime_type ?? 'video/mp4',
+          contentLength: f.contentLength?.toString(),
+          url: f.url as string,
+          mimeType: f.mimeType as string,
           bitrate: f.bitrate,
           audioUrl: bestAudioUrl,
-          audioMimeType: bestAudioMime,
+          audioMimeType: bestAudioFmt?.mimeType ?? 'audio/mp4',
         };
       })
       .filter(Boolean);
 
-    // Audio-only formats
+    // Audio-only formats (up to 3)
     const audioFormats = allAdaptive
-      .filter((f: any) => !f.has_video && f.has_audio)
+      .filter((f: any) => f.audioQuality && !f.qualityLabel)
       .slice(0, 3)
       .map((f: any) => {
-        const resolvedUrl = resolveUrl(f);
-        if (!resolvedUrl) return null;
-        const container = (f.mime_type ?? 'audio/mp4').split(';')[0].split('/')[1] ?? 'm4a';
         const kbps = f.bitrate ? Math.round(f.bitrate / 1000) : '?';
+        const container = (f.mimeType as string).split(';')[0].split('/')[1] ?? 'm4a';
         return {
           itag: f.itag ?? 0,
           qualityLabel: `Audio (${kbps}kbps)`,
           container,
           hasVideo: false,
           hasAudio: true,
-          contentLength: f.content_length?.toString(),
-          url: resolvedUrl,
-          mimeType: f.mime_type ?? 'audio/mp4',
+          contentLength: f.contentLength?.toString(),
+          url: f.url as string,
+          mimeType: f.mimeType as string,
           bitrate: f.bitrate,
           audioBitrate: typeof kbps === 'number' ? kbps : undefined,
         };
-      })
-      .filter(Boolean);
+      });
 
-    // Order: muxed (360p) → HD video-only (1080p, 720p) → audio-only
     const formats = [...muxedFormats, ...videoOnlyFormats, ...audioFormats];
 
     if (formats.length === 0) {
@@ -197,21 +221,22 @@ export async function GET(request: Request) {
       );
     }
 
-    const thumbnails = basic.thumbnail ?? [];
+    const vd = playerData.videoDetails ?? {};
+    const thumbnails: any[] = vd.thumbnail?.thumbnails ?? [];
     const thumbnail =
       [...thumbnails].sort((a: any, b: any) => (b.width ?? 0) - (a.width ?? 0))[0]?.url ?? '';
 
     return NextResponse.json({
-      title: basic.title ?? 'Unknown Title',
+      title: vd.title ?? 'Unknown Title',
       thumbnail,
-      duration: basic.duration ?? 0,
-      channel: basic.channel?.name ?? basic.author ?? 'Unknown',
-      viewCount: basic.view_count?.toString(),
+      duration: parseInt(vd.lengthSeconds ?? '0', 10),
+      channel: vd.author ?? 'Unknown',
+      viewCount: vd.viewCount?.toString(),
       formats,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error';
-    console.error('YouTube fetch error:', message);
+    console.error('[yt-edge] unhandled:', message);
 
     if (message.includes('private') || message.includes('LOGIN_REQUIRED')) {
       return NextResponse.json({ error: 'Video is private or requires login' }, { status: 403 });
