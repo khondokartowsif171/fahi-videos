@@ -23,10 +23,9 @@ function extractVideoId(url: string): string | null {
   }
 }
 
-function getUrl(f: any): string | null {
-  if (typeof f.url === 'string' && f.url.startsWith('https://')) return f.url;
-  return null;
-}
+// TV_EMBEDDED first — works on cloud IPs without a PO token.
+// ANDROID / IOS as fallbacks for muxed direct URLs.
+const CLIENTS = ['TV_EMBEDDED', 'ANDROID', 'IOS', 'WEB'] as const;
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -42,34 +41,52 @@ export async function GET(request: Request) {
   }
 
   try {
-    const yt = await Innertube.create({ cache: undefined });
+    const yt = await Innertube.create({
+      cache: undefined,
+      generate_session_locally: true,
+    });
 
-    // ANDROID gives direct string URLs for muxed formats.
-    // IOS gives direct string URLs for adaptive formats.
-    // Run both in parallel.
-    const [androidResult, iosResult] = await Promise.allSettled([
-      yt.getInfo(videoId, { client: 'ANDROID' }),
-      yt.getInfo(videoId, { client: 'IOS' }),
-    ]);
+    let info: any = null;
+    for (const client of CLIENTS) {
+      try {
+        const candidate = await yt.getInfo(videoId, { client });
+        if (candidate.streaming_data) {
+          info = candidate;
+          break;
+        }
+      } catch {
+        // try next client
+      }
+    }
 
-    const androidInfo = androidResult.status === 'fulfilled' ? androidResult.value : null;
-    const iosInfo = iosResult.status === 'fulfilled' ? iosResult.value : null;
-
-    if (!androidInfo?.streaming_data && !iosInfo?.streaming_data) {
+    if (!info?.streaming_data) {
       return NextResponse.json(
         { error: 'No streaming data available for this video' },
         { status: 404 }
       );
     }
 
-    // Prefer ANDROID for basic_info; fall back to IOS
-    const basic = (androidInfo ?? iosInfo)!.basic_info;
+    const basic = info.basic_info;
+    const streamingData = info.streaming_data;
+    const player = yt.session.player;
 
-    // Muxed formats (video + audio) — ANDROID has direct string URLs for these
-    const muxedSd = androidInfo?.streaming_data ?? iosInfo?.streaming_data;
-    const muxedFormats = (muxedSd?.formats ?? [])
+    // decipher() must be called first — it transforms the obfuscated n-parameter
+    // so YouTube doesn't return 403. f.url is the raw (broken) URL.
+    const resolveUrl = (f: any): string | null => {
+      try {
+        if (typeof f.decipher === 'function') {
+          const u = f.decipher(player);
+          if (typeof u === 'string' && u.startsWith('https://')) return u;
+        }
+      } catch { /* ignore */ }
+      if (typeof f.url === 'string' && f.url.startsWith('https://')) return f.url;
+      return null;
+    };
+
+    // Muxed formats (video + audio together)
+    const muxedFormats = (streamingData.formats ?? [])
       .map((f: any) => {
-        const resolvedUrl = getUrl(f);
+        const resolvedUrl = resolveUrl(f);
         if (!resolvedUrl) return null;
         const quality = f.quality_label ?? `${f.height ?? '?'}p`;
         const container = (f.mime_type ?? 'video/mp4').split(';')[0].split('/')[1] ?? 'mp4';
@@ -87,17 +104,16 @@ export async function GET(request: Request) {
       })
       .filter(Boolean);
 
-    // Adaptive formats — IOS has direct string URLs for these
-    const allAdaptive: any[] = iosInfo?.streaming_data?.adaptive_formats ?? [];
+    const allAdaptive: any[] = streamingData.adaptive_formats ?? [];
 
-    // Best audio stream for client-side merge
-    const bestAudioFmt = [...allAdaptive]
+    // Best audio stream for client-side merging with video-only formats
+    const bestAudioFmt = allAdaptive
       .filter((f: any) => f.has_audio && !f.has_video)
-      .sort((a: any, b: any) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0] ?? null;
-    const bestAudioUrl = bestAudioFmt ? getUrl(bestAudioFmt) : null;
+      .sort((a: any, b: any) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
+    const bestAudioUrl = bestAudioFmt ? resolveUrl(bestAudioFmt) : null;
     const bestAudioMime: string = bestAudioFmt?.mime_type ?? 'audio/mp4';
 
-    // Video-only adaptive formats >= 720p (client merges audio via FFmpeg.wasm)
+    // Video-only adaptive formats >= 720p (need client-side FFmpeg merge)
     const seenHeights = new Set<number>();
     const videoOnlyFormats = allAdaptive
       .filter((f: any) => f.has_video && !f.has_audio && (f.height ?? 0) >= 720)
@@ -106,7 +122,7 @@ export async function GET(request: Request) {
         const h: number = f.height ?? 0;
         if (seenHeights.has(h)) return null;
         seenHeights.add(h);
-        const resolvedUrl = getUrl(f);
+        const resolvedUrl = resolveUrl(f);
         if (!resolvedUrl || !bestAudioUrl) return null;
         const container = (f.mime_type ?? 'video/mp4').split(';')[0].split('/')[1] ?? 'mp4';
         return {
@@ -125,12 +141,12 @@ export async function GET(request: Request) {
       })
       .filter(Boolean);
 
-    // Audio-only formats (top 3 by bitrate)
+    // Audio-only formats
     const audioFormats = allAdaptive
       .filter((f: any) => !f.has_video && f.has_audio)
       .slice(0, 3)
       .map((f: any) => {
-        const resolvedUrl = getUrl(f);
+        const resolvedUrl = resolveUrl(f);
         if (!resolvedUrl) return null;
         const container = (f.mime_type ?? 'audio/mp4').split(';')[0].split('/')[1] ?? 'm4a';
         const kbps = f.bitrate ? Math.round(f.bitrate / 1000) : '?';
@@ -149,7 +165,7 @@ export async function GET(request: Request) {
       })
       .filter(Boolean);
 
-    // Order: muxed → HD video-only (1080p, 720p) → audio-only
+    // Order: muxed (360p) → HD video-only (1080p, 720p) → audio-only
     const formats = [...muxedFormats, ...videoOnlyFormats, ...audioFormats];
 
     if (formats.length === 0) {
