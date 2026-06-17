@@ -21,10 +21,6 @@ LABEL traefik.http.routers.fahi-main-https.rule=Host(`fahi-videos.auraajenticai.
 LABEL traefik.http.routers.fahi-main-https.tls=true
 LABEL traefik.http.routers.fahi-main-https.tls.certresolver=letsencrypt
 LABEL traefik.http.routers.fahi-main-https.service=fahi-main-svc
-LABEL traefik.http.routers.fahi-main-http.entrypoints=http
-LABEL traefik.http.routers.fahi-main-http.rule=Host(`fahi-videos.auraajenticai.cloud`)
-LABEL traefik.http.routers.fahi-main-http.middlewares=redirect-to-https
-LABEL traefik.http.routers.fahi-main-http.service=fahi-main-svc
 LABEL traefik.http.services.fahi-main-svc.loadbalancer.server.port=3000
 LABEL traefik.http.services.fahi-main-svc.loadbalancer.server.scheme=http
 
